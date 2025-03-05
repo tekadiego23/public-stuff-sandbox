@@ -1,0 +1,75 @@
+1. Utilisation d’AWS EKS Managed Nodes (Node Groups gérés par AWS)
+Description
+AWS EKS permet de créer des groupes de nœuds gérés directement par AWS, en utilisant EC2. L’intégration avec les Auto Scaling Groups (ASG) permet de gérer automatiquement l’échelle des nœuds.
+
+Avantages
+Simplicité : AWS gère automatiquement le cycle de vie des nœuds (création, mise à jour et remplacement).
+Sécurité : Mise à jour des nœuds facilitée avec le mode rolling update.
+Autoscaling facile : L’intégration avec l'Auto Scaling d'EC2 permet d'ajouter ou de supprimer des nœuds en fonction de la charge.
+Meilleure intégration avec AWS : IAM, CloudWatch, etc.
+Inconvénients
+Flexibilité limitée : Moins de contrôle sur la configuration fine des nœuds.
+Mises à jour dépendantes d’AWS : Bien qu’automatisées, les mises à jour des AMI peuvent introduire des délais ou des changements non souhaités.
+Coût légèrement plus élevé : AWS facture un supplément pour la gestion des nœuds.
+Autoscaling
+Utilise Cluster Autoscaler (CA) ou Karpenter pour ajuster automatiquement le nombre de nœuds.
+Peut être combiné avec des Spot Instances pour réduire les coûts.
+2. Utilisation d’Auto Scaling Groups (ASG) avec des instances EC2 auto-gérées
+Description
+Cette méthode consiste à créer un ASG manuellement et à l'intégrer avec un cluster EKS, en installant et en configurant Kubernetes sur les instances EC2.
+
+Avantages
+Plus de contrôle : Possibilité de choisir ses propres AMI et de configurer les nœuds selon ses besoins.
+Coût potentiellement réduit : Permet d’utiliser des instances Spot ou Reserved Instances.
+Mises à jour contrôlées : Plus de flexibilité sur les mises à jour du système.
+Inconvénients
+Complexité accrue : Il faut gérer soi-même le provisionnement, les mises à jour et les remplacements de nœuds.
+Gestion de l’autoscaling : Il faut configurer manuellement Cluster Autoscaler (CA) ou Karpenter pour gérer l’autoscaling.
+Autoscaling
+Basé sur Cluster Autoscaler (CA) pour ajouter/supprimer des nœuds en fonction des Pods en attente.
+Karpenter peut être utilisé pour une gestion plus dynamique et efficace de l’autoscaling.
+Peut être combiné avec EC2 Spot Instances pour réduire les coûts.
+3. Utilisation de Fargate pour les workloads serverless
+Description
+AWS Fargate permet d'exécuter des workloads Kubernetes sans gérer d'instances EC2. Les pods sont directement exécutés dans un environnement managé par AWS.
+
+Avantages
+Aucune gestion de nœuds : AWS s’occupe du provisionnement, du scaling et de la maintenance.
+Sécurité accrue : Pas de gestion de patching ou d’accès SSH aux nœuds.
+Facturation à l’usage : On ne paie que pour les ressources réellement consommées.
+Inconvénients
+Coût élevé : Plus cher que les EC2 classiques pour des workloads longs et intensifs.
+Limitations des workloads : Ne supporte pas les DaemonSets, certains contrôleurs nécessitant un accès au nœud, ou des besoins en stockage local spécifique.
+Moins de flexibilité : Les options de personnalisation des nœuds sont limitées.
+Autoscaling
+Géré automatiquement par AWS en fonction des demandes des pods.
+Pas besoin de Cluster Autoscaler, mais des latences peuvent être observées lors du provisionnement des pods.
+4. Utilisation de Karpenter pour un scaling plus rapide et efficace
+Description
+Karpenter est un autoscaler avancé qui permet de créer et de supprimer dynamiquement des nœuds EC2 en fonction des besoins des pods, sans passer par des Auto Scaling Groups.
+
+Avantages
+Scaling plus rapide : Réagit en quelques secondes aux besoins des workloads, contrairement au Cluster Autoscaler qui dépend des ASG.
+Optimisation des coûts : Sélection automatique des meilleures instances EC2 en fonction des besoins.
+Flexibilité accrue : Permet d’ajouter des nœuds de tailles différentes en fonction des workloads.
+Inconvénients
+Configuration plus complexe : Demande une configuration avancée pour bien tirer parti de ses fonctionnalités.
+Support encore récent : Moins mature que le Cluster Autoscaler et peut présenter des limitations dans certains cas.
+Autoscaling
+Supprime les nœuds inutilisés immédiatement après leur période de refroidissement.
+Choisit automatiquement les types d’instances optimaux.
+Réduit le "bin packing problem" en optimisant l’utilisation des nœuds.
+Comparaison des solutions d’installation et d’autoscaling
+Mode d’installation	Flexibilité	Coût	Facilité de gestion	Autoscaling	Idéal pour
+EKS Managed Node Groups	Moyen	Moyen	Facile	Cluster Autoscaler ou Karpenter	Déploiements standards nécessitant peu de gestion des nœuds
+ASG + EC2 auto-géré	Élevée	Faible (avec Spot)	Complexe	Cluster Autoscaler ou Karpenter	Workloads nécessitant un contrôle avancé des nœuds
+Fargate	Faible	Élevé	Très facile	Automatique	Workloads serverless et éphémères
+Karpenter	Élevée	Optimisé	Moyenne	Très rapide	Workloads dynamiques nécessitant un scaling rapide
+Conclusion
+Le choix de l’installation d’un cluster Kubernetes EKS dépend de plusieurs critères :
+
+Simplicité vs contrôle : Si vous voulez un minimum de gestion, Fargate ou Managed Node Groups sont adaptés. Si vous voulez plus de flexibilité, alors ASG ou Karpenter sont de meilleures options.
+Coût : Les instances Spot + Karpenter offrent le meilleur rapport coût-performance, mais demandent une configuration plus avancée.
+Autoscaling : Pour un scaling réactif et optimisé, Karpenter est le meilleur choix. Cluster Autoscaler fonctionne bien mais dépend des ASG, ce qui peut ralentir les opérations.
+Si votre priorité est la simplicité, utilisez EKS Managed Nodes ou Fargate.
+Si vous recherchez un contrôle et une optimisation avancée, privilégiez Karpenter avec EC2 Spot
