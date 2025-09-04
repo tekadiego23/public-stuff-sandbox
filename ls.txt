@@ -1,0 +1,15 @@
+CASE
+  WHEN REGEXP_MATCH(project, ".*8661950.*") THEN "RISK-STORE"
+  WHEN REGEXP_MATCH(project, ".*9755067.*") THEN "CONTEXT-STORE"
+  WHEN REGEXP_MATCH(env, ".*rwa.*|.*ccr.*|.*firebird-3.*") THEN "COUNTERPART CREDIT RISK"
+  WHEN REGEXP_MATCH(env, ".*firebird-2.*|.*fb-2.*|.*ima.*|.*plat.*") THEN "FRTB IMA"
+  WHEN REGEXP_MATCH(env, ".*nest.*") THEN "LIFECYCLE"
+  WHEN REGEXP_MATCH(env, ".*tr.*") THEN "TRADED-RISK"
+  WHEN REGEXP_MATCH(env, ".*qnt.*") THEN "QUANTS"
+  WHEN REGEXP_MATCH(env, ".*usat.*|.*st.*|.*ncs.*|.*eco.*|.*sic.*|.*seq.*|.*st1.*") THEN "WEALTH"
+  WHEN REGEXP_MATCH(env, ".*srk.*|.*ccr.*") THEN "MASA"
+  WHEN REGEXP_MATCH(env, ".*tra.*|.*usa.*|.*itc.*") THEN "SOPHIS-UI"
+  WHEN REGEXP_MATCH(env, ".*bat.*|.*mud.*|.*fdsf.*|.*eoy.*|.*mra.*|.*pln.*|.*futp.*|.*sop.*|.*rhl.*") 
+     OR REGEXP_MATCH(project, ".*10403702.*") THEN "SOPHIS-BATCH"
+  ELSE "MARKET RISK VaR - STRESS VaR"
+END
