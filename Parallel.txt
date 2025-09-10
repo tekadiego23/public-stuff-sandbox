@@ -1,0 +1,124 @@
+from typing import Any, Dict, Optional
+import os
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field, ValidationError
+
+# ---------- Config ----------
+CALC_URL = os.getenv("CALC_URL", "http://calculator:8080/compute")  # endpoint du service de calcul
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "5.0"))        # s, > 3s
+MAX_CONNECTIONS = int(os.getenv("MAX_CONNECTIONS", "600"))          # >= nb req parallèles attendues
+MAX_KEEPALIVE = int(os.getenv("MAX_KEEPALIVE", "200"))
+
+# ---------- Modèles ----------
+class PricingInput(BaseModel):
+    # Exemple de charge utile : adaptez les champs à votre domaine
+    product_id: str = Field(..., examples=["SKU-123"])
+    quantity: int = Field(..., ge=1, examples=[3])
+    currency: str = Field("EUR", min_length=3, max_length=3, examples=["EUR"])
+    # payload libre supplémentaire
+    metadata: Optional[Dict[str, Any]] = None
+
+class PricingResult(BaseModel):
+    # Miroir de ce que renvoie le service de calcul, à ajuster si besoin
+    product_id: str
+    quantity: int
+    currency: str
+    price: float
+    breakdown: Optional[Dict[str, Any]] = None
+
+# ---------- App ----------
+app = FastAPI(title="Pricing Gateway", version="1.0.0")
+
+# Création d’un client HTTP asynchrone global avec pool généreux.
+# Important pour que 300 requêtes puissent partir en parallèle sans se mettre en file d’attente.
+@app.on_event("startup")
+async def startup() -> None:
+    limits = httpx.Limits(
+        max_connections=MAX_CONNECTIONS,
+        max_keepalive_connections=MAX_KEEPALIVE,
+        keepalive_expiry=30.0,
+    )
+    transport = httpx.AsyncHTTPTransport(
+        retries=2,  # petites erreurs réseau transitoires
+    )
+    app.state.http = httpx.AsyncClient(
+        timeout=httpx.Timeout(REQUEST_TIMEOUT),
+        limits=limits,
+        transport=transport,
+        headers={"Connection": "keep-alive"},
+    )
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    client: httpx.AsyncClient = app.state.http
+    await client.aclose()
+
+# Endpoint simple : 1 requête => 1 appel REST au calculateur
+@app.post("/price", response_model=PricingResult)
+async def price(request: Request) -> PricingResult:
+    # Lecture et validation manuelles pour renvoyer une 422 claire si payload invalide
+    try:
+        payload = await request.json()
+        data = PricingInput.model_validate(payload)
+    except ValidationError as ve:
+        raise HTTPException(status_code=422, detail=ve.errors())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    client: httpx.AsyncClient = app.state.http
+
+    try:
+        # Appel non bloquant : tant que le service de calcul traite en //,
+        # ici chaque requête user restera ~ au temps de calcul (~3s).
+        resp = await client.post(CALC_URL, json=data.model_dump())
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Upstream calculation timed out")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+
+    if resp.status_code >= 400:
+        # Propager proprement les erreurs amont
+        raise HTTPException(status_code=502, detail=f"Upstream returned {resp.status_code}: {resp.text}")
+
+    try:
+        result_json = resp.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Upstream returned non-JSON")
+
+    # On valide/schéma la réponse pour cohérence contractuelle
+    try:
+        return PricingResult.model_validate(result_json)
+    except ValidationError:
+        # Si l’amont ne suit pas strictement le schéma, on renvoie tel quel
+        # pour éviter d’allonger la latence. À activer/désactiver selon vos besoins.
+        return result_json  # type: ignore[return-value]
+
+# Optionnel : endpoint batch si vous voulez aussi accepter un tableau d’entrées dans UNE requête.
+# Cela permet de paralléliser côté serveur même pour un appel unique.
+from typing import List, Union
+
+@app.post("/price:batch", response_model=List[PricingResult])
+async def price_batch(items: List[PricingInput]) -> List[PricingResult]:
+    client: httpx.AsyncClient = app.state.http
+
+    async def one_call(item: PricingInput):
+        r = await client.post(CALC_URL, json=item.model_dump())
+        r.raise_for_status()
+        return PricingResult.model_validate(r.json())
+
+    import asyncio
+    # Lancement simultané de toutes les requêtes amont
+    results = await asyncio.gather(*[one_call(i) for i in items], return_exceptions=True)
+
+    # Normalisation des erreurs en réponses HTTP (conservant l’ordre)
+    out: List[PricingResult] = []
+    for res in results:
+        if isinstance(res, Exception):
+            # Vous pouvez décider d’échouer tout le batch ou d’encoder l’erreur dans l’élément.
+            # Ici on remonte une 502 globale si une des sous-requêtes échoue.
+            raise HTTPException(status_code=502, detail=str(res))
+        else:
+            out.append(res)
+    return out
