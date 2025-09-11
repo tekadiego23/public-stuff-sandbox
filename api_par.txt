@@ -1,0 +1,18 @@
+from fastapi import APIRouter, Request, Header, BackgroundTasks
+
+# imports projet
+import eqs.apis.models
+from .requests_apis import forward_post_request  # <= le def async ci-dessous
+from .common import RequestType                  # ton enum
+
+router = APIRouter()
+
+@router.post("/sync-pricing-request", responses=eqs.apis.responses.responses_job_results)
+async def sync_pricing_request(
+    request: Request,
+    reqJson: eqs.apis.models.PricingRequestBody,
+    background_tasks: BackgroundTasks,
+    trace_id: str = Header(None),
+):
+    # logique inchangée : on délègue au forwarder
+    return await forward_post_request(request, reqJson, RequestType.syncPricingRequest)
