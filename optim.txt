@@ -1,65 +1,114 @@
-# eqs/apis/utils_async.py
-import asyncio
+# eqs/apis/common.py
+import time
+import traceback
 from fastapi.responses import JSONResponse
 
-def run_forward_post_request(app, reqJson, requestType, sla_seconds: float = 10.0):
+# === adapte ces imports à ton projet ===
+from eqs.pricer import Pricer
+from eqs.apis.models import RequestType  # enum existant
+
+
+def _deadline_left(deadline: float, *, min_read: float = 0.2) -> float:
     """
-    Exécute forward_post_request (sync) dans le thread pool FastAPI.
-    Protège par un timeout SLA (par défaut 10s).
+    Retourne le temps restant avant la deadline, en s'assurant qu'il reste
+    un minimum pour le read timeout.
     """
-    loop = asyncio.get_running_loop()
-
-    def _sync_call():
-        return app.state.forward_post_request(
-            reqJson=reqJson,
-            requestType=requestType,
-            pricer_factory=app.state.get_pricer,
-            sla_seconds=sla_seconds,
-        )
-
-    return asyncio.wait_for(
-        loop.run_in_executor(app.state.tpool, _sync_call),
-        timeout=sla_seconds,
-    )
+    left = max(0.0, deadline - time.monotonic())
+    return left if left > min_read else 0.0
 
 
-
-# eqs/apis/requests_apis.py
-from fastapi import APIRouter, Request, Header
-from fastapi.responses import JSONResponse
-import eqs.apis.models as models
-from .utils_async import run_forward_post_request
-
-router = APIRouter()
-
-@router.post("/pricing-request")
-async def pricing_request(
-    request: Request,
-    reqJson: models.PricingRequestBody,
-    trace_id: str | None = Header(default=None),
+def forward_get_request(
+    reqJson,                         # eqs.apis.models.PricingRequestSummary
+    requestType: RequestType,
+    pricer_factory=None,
+    sla_seconds: float = 10.0,
 ):
+    """
+    Version synchrone : NE PAS faire d'await ici.
+    Utilisée depuis un thread du ThreadPoolExecutor.
+    """
     try:
-        return await run_forward_post_request(
-            app=request.app,
-            reqJson=reqJson,
-            requestType=models.RequestType.pricingRequest,
-            sla_seconds=10.0,
-        )
-    except asyncio.TimeoutError:
-        return JSONResponse(status_code=504, content={"message": "SLA 10s exceeded"})
+        phoenix_env = reqJson.phoenix_env
+        phoenix_job_id = reqJson.phoenix_job_id
 
-@router.post("/sync-no-dist-request")
-async def sync_no_dist_request(
-    request: Request,
-    reqJson: models.PricingRequestBody,
+        pricer = pricer_factory(phoenix_env) if pricer_factory else Pricer(phoenix_env)
+
+        req_url = (
+            pricer.client.url
+            + requestType.value[1]
+            + "?phoenix_job_id="
+            + phoenix_job_id
+        )
+
+        deadline = time.monotonic() + sla_seconds
+        connect_to, read_to = 2.0, min(8.0, _deadline_left(deadline))
+        resp = pricer.client.session.get(req_url, timeout=(connect_to, read_to))
+        resp.raise_for_status()
+        return JSONResponse(status_code=200, content=resp.json())
+    except Exception as err:
+        return JSONResponse(
+            status_code=500,
+            content={"message": f"Unexpected {err=} {type(err)=}\n{traceback.format_exc()}"},
+        )
+
+
+def forward_post_request(
+    reqJson,                         # eqs.apis.models.PricingRequestBody
+    requestType: RequestType,
+    pricer_factory=None,
+    sla_seconds: float = 10.0,
 ):
-    try:
-        return await run_forward_post_request(
-            app=request.app,
-            reqJson=reqJson,
-            requestType=models.RequestType.noDistRequest,
-        )
-    except asyncio.TimeoutError:
-        return JSONResponse(status_code=504, content={"message": "SLA 10s exceeded"})
+    """
+    Version synchrone : garde ta logique actuelle, avec timeouts et deadline.
+    """
+    import time as _time  # éviter le shadow
 
-# ⬆️ Tu dupliques ce schéma pour tes 3 autres endpoints
+    try:
+        phoenix_env = reqJson.phoenix_env
+        pricer = pricer_factory(phoenix_env) if pricer_factory else Pricer(phoenix_env)
+
+        phoenix_url = pricer.client.url + requestType.value[1]
+        deadline = _time.monotonic() + sla_seconds
+
+        # POST initial
+        connect_to, read_to = 2.0, min(8.0, _deadline_left(deadline))
+        resp = pricer.client.session.post(
+            phoenix_url, json=reqJson.model_dump(), timeout=(connect_to, read_to)
+        )
+        if resp.status_code != 200:
+            return JSONResponse(
+                status_code=503,
+                content={"message": f"Phoenix status={resp.status_code}", "phoenix_url": phoenix_url},
+            )
+
+        try:
+            payload = resp.json()
+        except Exception:
+            return JSONResponse(status_code=502, content={"message": "Invalid JSON from Phoenix"})
+
+        # Si pas de job_id → réponse directe
+        job_id = payload.get("id") or payload.get("phoenix_job_id")
+        if not job_id:
+            return JSONResponse(status_code=200, content=payload)
+
+        # Sinon, polling borné par la deadline
+        poll_url = pricer.client.url + "/job-results"
+        while True:
+            left = _deadline_left(deadline)
+            if left <= 0:
+                return JSONResponse(status_code=504, content={"message": "SLA 10s exceeded"})
+            r = pricer.client.session.get(
+                poll_url, params={"phoenix_job_id": job_id}, timeout=(2.0, min(8.0, left))
+            )
+            if r.status_code == 200:
+                try:
+                    return JSONResponse(status_code=200, content=r.json())
+                except Exception:
+                    return JSONResponse(status_code=502, content={"message": "Invalid job JSON"})
+            _time.sleep(0.2)  # OK: on est dans un thread, pas dans l'event loop
+
+    except Exception as err:
+        return JSONResponse(
+            status_code=500,
+            content={"message": f"Unexpected {err=} {type(err)=}\n{traceback.format_exc()}"},
+        )
