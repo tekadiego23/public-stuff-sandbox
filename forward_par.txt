@@ -1,178 +1,44 @@
-import base64
-import copy
-import pprint
-import traceback
-import anyio
+# eqs/apis/utils_async.py
+import asyncio
 from fastapi.responses import JSONResponse
 
-# === imports projet (inchangés) ===
-import eqs.apis.models
-from odyproto.root_pb2 import RootNode
-from .common import logged_return, reformat_error, RequestType
-from .phoenix_client import Pricer, JobSummary  # ou l'emplacement réel dans ton projet
 
-# ---------- helpers pour offloader le CPU ----------
-def _b64decode(s: str) -> bytes:
-    return base64.urlsafe_b64decode(s)
+async def run_forward_post_request(app, reqJson, requestType, sla_seconds: float = 10.0):
+    """
+    Exécute forward_post_request (sync) dans le thread pool de l'app.
+    Protège l'appel avec un timeout = SLA.
+    """
+    loop = asyncio.get_running_loop()
 
-def _parse_root(bytes_: bytes) -> RootNode:
-    root = RootNode()
-    root.ParseFromString(bytes_)
-    return root
-
-def _serialize_b64(root: RootNode) -> str:
-    return base64.urlsafe_b64encode(root.SerializeToString()).decode("utf-8")
-
-def _template_to_generics_sync(ctx):
-    # on appelle ta fonction sync telle quelle
-    from .templating import template_to_generics  # adapte l'import si besoin
-    return template_to_generics(ctx)
-
-# ---------- I/O sync via requests.Session -> threadpool ----------
-def _requests_post(session, url: str, json_payload: dict, timeout_sec: float):
-    # même logique que la lib : POST sync
-    return session.post(url, json=json_payload, timeout=timeout_sec)
-
-def _requests_get(session, url: str, timeout_sec: float):
-    return session.get(url, timeout=timeout_sec)
-
-def _response_json_sync(resp):
-    return resp.json()
-
-# ================================================================
-
-async def forward_post_request(
-    request,
-    reqJson: "eqs.apis.models.PricingRequestBody",
-    requestType: "RequestType",
-):
-    try:
-        logger.info(
-            "POST request body; requestType=%s;\n%s",
-            requestType, pprint.pformat(reqJson.model_dump()),
+    def _sync_call():
+        return app.state.forward_post_request(
+            reqJson=reqJson,
+            requestType=requestType,
+            pricer_factory=app.state.get_pricer,
+            sla_seconds=sla_seconds,
         )
 
-        phoenix_env = reqJson.phoenix_env
-        pricer = Pricer(eqphoenix_env=phoenix_env)  # logique inchangée
+    return await asyncio.wait_for(
+        loop.run_in_executor(app.state.tpool, _sync_call),
+        timeout=sla_seconds,
+    )
 
-        # CPU -> threadpool
-        result_bytes = await anyio.to_thread.run_sync(_b64decode, reqJson.base64_request)
-        root_node = await anyio.to_thread.run_sync(_parse_root, result_bytes)
 
-    except Exception:
-        message = f"Failed to validate input {traceback.format_exc()}"
-        dct = eqs.apis.models.MessageOnly(message=message).model_dump()
-        return logged_return(400, dct)
+async def run_forward_get_request(app, reqJson, requestType, sla_seconds: float = 10.0):
+    """
+    Idem pour forward_get_request (sync).
+    """
+    loop = asyncio.get_running_loop()
 
-    try:
-        # CPU -> threadpool
-        template_output = await anyio.to_thread.run_sync(
-            _template_to_generics_sync, root_node.pricing_request.context
+    def _sync_call():
+        return app.state.forward_get_request(
+            reqJson=reqJson,
+            requestType=requestType,
+            pricer_factory=app.state.get_pricer,
+            sla_seconds=sla_seconds,
         )
-    except Exception:
-        message = f"template_to_generics_failed; \ntraceback:\n{traceback.format_exc()}"
-        dct = eqs.apis.models.MessageOnly(message=message).model_dump()
-        return logged_return(500, dct)
 
-    output = {
-        "template_errors": [reformat_error(error) for error in template_output.errors],
-    }
-
-    if not template_output.successful:
-        output["message"] = "No products converted to generic or copied."
-        dct = eqs.apis.models.ResponseWithoutJob(**output).model_dump()
-        return logged_return(500, dct)
-
-    # met à jour le root avec le contexte transformé, puis re-encode
-    root_node.pricing_request.context.CopyFrom(template_output.context)
-    new_base64_request = await anyio.to_thread.run_sync(_serialize_b64, root_node)
-    reqJson.base64_request = new_base64_request
-
-    # -------------------------
-    # Appel HTTP vers Phoenix
-    # -------------------------
-    try:
-        phoenix_url = pricer._client_url
-        req_url = phoenix_url + requestType.value[1]
-        output["phoenix_url"] = phoenix_url
-
-        # IMPORTANT : injecter la session poolée créée en startup
-        # (la lib expose un attribut ._client_session basé sur requests.Session)
-        try:
-            pricer._client_session = request.app.state.requests_session
-        except Exception:
-            # si l'attribut diffère, adapte le nom (._session / .session)
-            pass
-
-        # I/O sync -> threadpool
-        response = await anyio.to_thread.run_sync(
-            _requests_post,
-            pricer._client_session,
-            req_url,
-            reqJson.model_dump(),
-            REQUEST_TIMEOUT,
-        )
-    except Exception:
-        output["message"] = f"could not get results from Phoenix: {traceback.format_exc()}"
-        dct = eqs.apis.models.ResponseWithoutJob(**output).model_dump()
-        return logged_return(502, dct)
-
-    if response.status_code != 200:
-        dct = eqs.apis.models.ResponseWithoutJob(**output).model_dump()
-        return logged_return(503, dct)
-
-    try:
-        # CPU (petit) mais on reste dans la même veine : on fait comme la lib sync
-        response_json = await anyio.to_thread.run_sync(_response_json_sync, response)
-    except Exception:
-        output["message"] = f"json not received from phoenix.\n{response.text}"
-        return logged_return(response.status_code, eqs.apis.models.ResponseWithoutJob(**output).model_dump())
-
-    try:
-        if requestType is RequestType.syncPricingRequest:
-            # logique métier inchangée : construction du JobSummary
-            initial_summary = JobSummary(**response_json)
-            if initial_summary.id is None:
-                output["message"] = (
-                    "QS forwarding failed. No job summary was received from the server."
-                    f" Status code received from Phoenix is {response.status_code}."
-                    f" Json received: {response_json}."
-                )
-                return logged_return(500, output)
-
-            # la lib fait un "and_wait" (bloquant) => offload
-            await anyio.to_thread.run_sync(pricer._client_and_wait, initial_summary, "job-summary")
-
-            resp_url = phoenix_url + "/job-results?phoenix_job_id=" + initial_summary.id
-            response = await anyio.to_thread.run_sync(
-                _requests_get, pricer._client_session, resp_url, REQUEST_TIMEOUT
-            )
-            response_json = await anyio.to_thread.run_sync(_response_json_sync, response)
-
-        elif requestType in [RequestType.noDistRequest, RequestType.pricingRequest]:
-            new_output = copy.deepcopy(output)
-            new_output["phoenix_url"] = phoenix_url
-            new_output["message"] = "Succeeded."
-            new_output.update(response_json)
-            dct = eqs.apis.models.ResponseWithJob(**new_output).model_dump()
-            return JSONResponse(status_code=200, content=dct)
-
-        # si on est ici (syncPricingRequest), on valide la réponse
-        try:
-            status = response_json["status"]
-        except Exception:
-            status = ""
-            output["message"] = (
-                "Failed to validate Phoenix response. Status = " + status
-            )
-            dct = eqs.apis.models.ResponseWithoutJob(**output).model_dump()
-            return logged_return(502, dct)
-
-        return JSONResponse(status_code=200, content=response_json)
-
-    except Exception:
-        output["message"] = f"Unexpected error traceback: \n{traceback.format_exc()}"
-        try:
-            return logged_return(500, output)
-        except Exception:
-            return output
+    return await asyncio.wait_for(
+        loop.run_in_executor(app.state.tpool, _sync_call),
+        timeout=sla_seconds,
+    )
