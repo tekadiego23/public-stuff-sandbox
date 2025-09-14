@@ -1,18 +1,96 @@
-from fastapi import APIRouter, Request, Header, BackgroundTasks
+# eqs/apis/requests_apis.py
+import asyncio
+from fastapi import APIRouter, Request, Header
+from fastapi.responses import JSONResponse
 
-# imports projet
-import eqs.apis.models
-from .requests_apis import forward_post_request  # <= le def async ci-dessous
-from .common import RequestType                  # ton enum
+# === adapte ces imports à ton projet ===
+from eqs.apis.models import (
+    RequestType,
+    PricingRequestBody,
+    PricingRequestSummary,
+)
+
+from eqs.apis.utils_async import run_forward_post_request, run_forward_get_request
 
 router = APIRouter()
 
-@router.post("/sync-pricing-request", responses=eqs.apis.responses.responses_job_results)
+
+@router.post("/pricing-request")
+async def pricing_request(
+    request: Request,
+    reqJson: PricingRequestBody,
+    trace_id: str | None = Header(default=None),
+):
+    try:
+        return await run_forward_post_request(
+            app=request.app,
+            reqJson=reqJson,
+            requestType=RequestType.pricingRequest,
+            sla_seconds=10.0,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={"message": "SLA 10s exceeded"})
+
+
+@router.post("/sync-no-dist-request")
+async def sync_no_dist_request(
+    request: Request,
+    reqJson: PricingRequestBody,
+):
+    try:
+        return await run_forward_post_request(
+            app=request.app,
+            reqJson=reqJson,
+            requestType=RequestType.noDistRequest,
+            sla_seconds=10.0,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={"message": "SLA 10s exceeded"})
+
+
+@router.post("/sync-pricing-request")
 async def sync_pricing_request(
     request: Request,
-    reqJson: eqs.apis.models.PricingRequestBody,
-    background_tasks: BackgroundTasks,
-    trace_id: str = Header(None),
+    reqJson: PricingRequestBody,
 ):
-    # logique inchangée : on délègue au forwarder
-    return await forward_post_request(request, reqJson, RequestType.syncPricingRequest)
+    try:
+        return await run_forward_post_request(
+            app=request.app,
+            reqJson=reqJson,
+            requestType=RequestType.syncPricingRequest,
+            sla_seconds=10.0,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={"message": "SLA 10s exceeded"})
+
+
+@router.post("/lifecycle-request")
+async def lifecycle_request(
+    request: Request,
+    reqJson: PricingRequestBody,
+):
+    try:
+        return await run_forward_post_request(
+            app=request.app,
+            reqJson=reqJson,
+            requestType=RequestType.lifecycleRequest,
+            sla_seconds=10.0,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={"message": "SLA 10s exceeded"})
+
+
+@router.get("/pricing-result")
+async def pricing_result(
+    request: Request,
+    reqJson: PricingRequestSummary,
+):
+    try:
+        return await run_forward_get_request(
+            app=request.app,
+            reqJson=reqJson,
+            requestType=RequestType.syncPricingRequest,  # ou celui adapté
+            sla_seconds=10.0,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={"message": "SLA 10s exceeded"})
