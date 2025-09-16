@@ -1,0 +1,44 @@
+# billing_by_position.py  (EXTRAIT REFACTO)
+
+import pandas as pd
+import numpy as np
+from contextstore_async import set_positions_concurrent
+
+async def get_positions_cost(by_job_df: pd.DataFrame) -> pd.DataFrame:
+    # 1) Enrichir via snaps_definition → transforme en table puis MERGE (au lieu de apply)
+    snaps_definition = json.loads(await get_variables("snaps_definition", "ppe"))
+    snaps_map = pd.DataFrame(snaps_definition)  # doit contenir les clés pour joindre
+    by_job_df = by_job_df.merge(snaps_map, how="left", left_on="job_snap", right_on="job_snap")
+
+    # 2) Fetch positions en CONCURRENCE (async)
+    #    -> renvoie un DF PLAT : une ligne par instrument/portfolio pour chaque job
+    by_job_positions = await set_positions_concurrent(
+        by_job_df,
+        cs_base_url = env_config["cs_base_url"],            # adapte
+        pf_detail_base_url = env_config["pf_detail_base_url"],
+        instrument_detail_base_url = env_config["inst_detail_base_url"],
+        auth=None,  # ou ton auth
+    )
+
+    # 3) Calculs vectorisés (pas d’apply):
+    #    a) temps de compute par instrument (tu as déjà instrument_computation_time)
+    #       Suppose qu’on a une colonne instrument_computation_time au niveau instrument
+    #       Sinon calcule-la à partir des réponses amont.
+
+    #    b) nb_positions_for_instruments -> c’est déjà 'n_epi' dans le DF plat
+    by_job_positions["position_computation_time"] = (
+        by_job_positions["instrument_computation_time"] / by_job_positions["n_epi"].replace(0, np.nan)
+    ).fillna(0)
+
+    #    c) somme par job (groupby)
+    g = (by_job_positions
+         .drop_duplicates(subset=["job_id","instrument_id"])
+         .groupby("job_id", as_index=False)["instrument_computation_time"].sum()
+         .rename(columns={"instrument_computation_time":"sum_instrument_time"}))
+
+    by_job_positions = by_job_positions.merge(g, on="job_id", how="left")
+
+    # 4) Explode EPI : tu as déjà un DF plat; si tu dois exploser une list epi_list, fais-le ici
+    # by_job_positions = by_job_positions.explode("epi_list", ignore_index=True)
+
+    return by_job_positions
