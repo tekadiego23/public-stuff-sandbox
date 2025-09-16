@@ -1,0 +1,222 @@
+# contextstore_async.py  (NOUVEAU)
+import asyncio, json, os
+from typing import Iterable, Dict, Any, List, Tuple
+import httpx
+
+# Limites de concurrence
+MAX_COMBO_CONCURRENCY = int(os.getenv("COMBO_CONCURRENCY", "8"))       # nb de combos (cutoff/cob/portfolios/env) en // 
+MAX_HTTP_CONCURRENCY  = int(os.getenv("HTTP_CONCURRENCY", "32"))       # nb de requêtes HTTP en //
+
+# caches process-wide (évite de recharger 1000x les mêmes détails)
+PORTFOLIO_CACHE: Dict[str, dict]  = {}
+INSTRUMENT_CACHE: Dict[str, dict] = {}
+
+def _mk_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        http2=True,
+        timeout=httpx.Timeout(connect=3.0, read=30.0, write=5.0),
+        limits=httpx.Limits(max_connections=MAX_HTTP_CONCURRENCY, max_keepalive_connections=MAX_HTTP_CONCURRENCY),
+        verify=False,  # comme dans tes calls requests()
+    )
+
+async def _retry(client: httpx.AsyncClient, method: str, url: str, **kw):
+    # petit retry simple (3 essais) – remplace si tu as mieux
+    for attempt in (1,2,3):
+        try:
+            r = await client.request(method, url, **kw)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            if attempt == 3:
+                raise
+            await asyncio.sleep(0.2 * attempt)
+
+async def _get_json(client: httpx.AsyncClient, url: str, params: dict | None = None, auth=None) -> dict:
+    r = await _retry(client, "GET", url, params=params, auth=auth, headers={"accept":"application/json","Content-Type":"application/json"})
+    return r.json()
+
+async def get_portfolio_detail(client: httpx.AsyncClient, base_url: str, pid: str, auth=None) -> dict:
+    if pid in PORTFOLIO_CACHE:
+        return PORTFOLIO_CACHE[pid]
+    data = await _get_json(client, f"{base_url}{pid}", params={"encoding":"json"}, auth=auth)
+    PORTFOLIO_CACHE[pid] = data
+    return data
+
+async def get_instrument_detail(client: httpx.AsyncClient, base_url: str, iid: str, auth=None) -> dict:
+    if iid in INSTRUMENT_CACHE:
+        return INSTRUMENT_CACHE[iid]
+    data = await _get_json(client, f"{base_url}{iid}", params={"encoding":"json"}, auth=auth)
+    INSTRUMENT_CACHE[iid] = data
+    return data
+
+async def get_portfolio_hierarchy(client: httpx.AsyncClient, url: str, auth=None) -> dict:
+    return await _get_json(client, url, auth=auth)
+
+def _group_positions_by_instrument(positions: list, pf_detail_base: str, inst_detail_base: str, auth=None):
+    """
+    Optimisé : on renvoie directement des LIGNES (instrument_id, n_epi, pf_id, hmsBook, legalEntity, desk)
+    plutôt qu'un dict imbriqué -> évite les apply plus tard.
+    """
+    rows: List[Tuple[str,int,str,str,str,str]] = []  # (instrument_id, n_epi, pf_id, hmsBook, legalEntity, desk)
+
+    # 1) collect unique ids pour prefetch
+    portfolio_ids = set()
+    instrument_ids = set()
+    for pos in positions:
+        for prod in pos.get("products", []):
+            iid = prod.get("id", {}).get("sophis", "")
+            if not iid: 
+                continue
+            instrument_ids.add(iid)
+            pf_id = pos.get("portfolioId", {}).get("sophis", "")
+            if pf_id:
+                portfolio_ids.add(pf_id)
+
+    return rows, portfolio_ids, instrument_ids  # on préremplit dans l'appelateur
+
+
+async def fetch_grouped_positions_for_portfolios(
+    client: httpx.AsyncClient,
+    cs_base_url: str,
+    pf_detail_base_url: str,
+    instrument_detail_base_url: str,
+    cutoff: str, cob_date: str, portfolios: Iterable[str], auth=None
+) -> List[dict]:
+    """
+    Retourne une liste de dicts plats par instrument:
+    {
+      "portfolio_id": "...", "instrument_id": "...",
+      "n_epi": 12, "hmsBook": "...", "legalEntity":"...", "desk":"..."
+    }
+    """
+    # 1) Récupère les arbres de positions de TOUS les portfolios en parallèle
+    sem = asyncio.Semaphore(MAX_HTTP_CONCURRENCY)
+
+    async def fetch_tree(pf: str):
+        url = f"{cs_base_url}/cutoff@{cob_date}/query/sophis/{pf}/TREE/PRODUCT_ALL/CASH_NONE"
+        async with sem:
+            data = await get_portfolio_hierarchy(client, url, auth=auth)
+            return data
+
+    trees = await asyncio.gather(*[fetch_tree(pf) for pf in portfolios])
+
+    # 2) Extraire positions et collecter IDs pour prefetch
+    all_rows: List[dict] = []
+    portfolio_ids: set[str] = set()
+    instrument_ids: set[str] = set()
+
+    from collections import defaultdict
+    def extract_positions(data):
+        # réutilise ta logique existante si tu as déjà une fonction extract_positions(data)
+        # ici on suppose que data contient la clé "positions"
+        return data.get("positions", [])
+
+    for t in trees:
+        positions = extract_positions(t)
+        # première passe: collect ids
+        for pos in positions:
+            pf_id = pos.get("portfolioId", {}).get("sophis", "")
+            if pf_id:
+                portfolio_ids.add(pf_id)
+            for prod in pos.get("products", []):
+                iid = prod.get("id", {}).get("sophis", "")
+                if iid:
+                    instrument_ids.add(iid)
+
+    # 3) Prefetch détails (concurrence)
+    async def prefetch_many(ids: Iterable[str], getter):
+        sem2 = asyncio.Semaphore(MAX_HTTP_CONCURRENCY)
+        async def one(x):
+            async with sem2:
+                return await getter(client, x)
+        await asyncio.gather(*[one(x) for x in ids])
+
+    # Les getters prennent (client, base_url, id, auth)
+    async def _get_pf(id_):
+        return await get_portfolio_detail(client, pf_detail_base_url, id_, auth=auth)
+
+    async def _get_inst(id_):
+        return await get_instrument_detail(client, instrument_detail_base_url, id_, auth=auth)
+
+    await asyncio.gather(
+        prefetch_many(portfolio_ids, lambda c, x: get_portfolio_detail(c, pf_detail_base_url, x, auth=auth)),
+        prefetch_many(instrument_ids, lambda c, x: get_instrument_detail(c, instrument_detail_base_url, x, auth=auth)),
+    )
+
+    # 4) Deuxième passe: construire des lignes PLATES (vectorisable)
+    for t in trees:
+        positions = extract_positions(t)
+        for pos in positions:
+            pf_id = pos.get("portfolioId", {}).get("sophis", "")
+            pf_detail = PORTFOLIO_CACHE.get(pf_id, {})
+            hmsBook = pf_detail.get("hmsBook","")
+            legalEntity = pf_detail.get("legalEntity","")
+            desk = pf_detail.get("desk","")
+            # pour chaque produit → une ligne avec n_epi
+            for prod in pos.get("products", []):
+                iid = prod.get("id", {}).get("sophis", "")
+                if not iid: 
+                    continue
+                epi = prod.get("epi", []) or []
+                all_rows.append({
+                    "portfolio_id": pf_id,
+                    "instrument_id": iid,
+                    "n_epi": len(epi),
+                    "hmsBook": hmsBook,
+                    "legalEntity": legalEntity,
+                    "desk": desk,
+                })
+
+    return all_rows
+
+
+async def set_positions_concurrent(by_job_df, cs_base_url: str, pf_detail_base_url: str, instrument_detail_base_url: str, auth=None):
+    """
+    Version async concurrente de set_positions:
+    - déduplique (cutoff, cob_date, portfolios, env)
+    - lance les fetchs en // avec limite
+    - renvoie un DataFrame PLAT prêt pour l'agrégat
+    """
+    import pandas as pd
+
+    # 1) clés uniques
+    by_job_df = by_job_df.copy()
+    by_job_df["position_keys"] = (
+        by_job_df["cutoff"].astype(str) + "|" +
+        by_job_df["cob_date"].astype(str) + "|" +
+        by_job_df["portfolios"].apply(lambda xs: ",".join(map(str, xs))) + "|" +
+        by_job_df["jest_api"].fillna("ppe")
+    )
+    uniq = by_job_df.drop_duplicates(subset=["position_keys"])[["cutoff","cob_date","portfolios","jest_api","position_keys"]]
+
+    client = _mk_client()
+    sem = asyncio.Semaphore(MAX_COMBO_CONCURRENCY)
+
+    async def run_one(row):
+        cutoff, cob_date, portfolios, env, key = row.cutoff, row.cob_date, tuple(row.portfolios), row.jest_api, row.position_keys
+        async with sem:
+            data = await fetch_grouped_positions_for_portfolios(
+                client=client,
+                cs_base_url=cs_base_url if env=="ppe" else cs_base_url.replace("ppe","prod"),
+                pf_detail_base_url=pf_detail_base_url,
+                instrument_detail_base_url=instrument_detail_base_url,
+                cutoff=cutoff, cob_date=cob_date, portfolios=portfolios, auth=auth
+            )
+            # on tag la clé pour le join
+            for d in data:
+                d["position_keys"] = key
+            return data
+
+    # 2) concurrence
+    tasks = [run_one(row) for _, row in uniq.iterrows()]
+    results: List[List[dict]] = await asyncio.gather(*tasks)
+    await client.aclose()
+
+    # 3) concat plat
+    flat = [item for sub in results for item in sub]
+    positions_df = pd.DataFrame.from_records(flat, columns=[
+        "position_keys","portfolio_id","instrument_id","n_epi","hmsBook","legalEntity","desk"
+    ])
+    # 4) Join sur by_job_df → chaque job récupère les lignes correspondantes
+    out = by_job_df.merge(positions_df, on="position_keys", how="left")
+    return out
