@@ -1,0 +1,71 @@
+from typing import Optional
+
+import asyncio
+import json
+
+from fastapi import FastAPI, HTTPException
+import httpx
+
+app = FastAPI()
+
+EXTERNAL_API_URL = "https://httpbin.org/delay/4"  # simule ~4s de latence
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    # Créer un AsyncClient réutilisable avec pool de connexions et keep-alive
+    limits = httpx.Limits(
+        max_keepalive_connections=100,  # connexions réutilisées
+        max_connections=200,            # plafond de connexions totales
+    )
+    timeout = httpx.Timeout(10.0, connect=5.0)  # marges de sécurité
+    app.state.http = httpx.AsyncClient(limits=limits, timeout=timeout, http2=True)
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    await app.state.http.aclose()
+
+
+@app.get("/proxy")
+async def proxy(q: Optional[str] = None):
+    """
+    Appelle l’API externe de manière non bloquante.
+    100 requêtes concurrentes vers /proxy devraient se terminer ~ en 4s.
+    """
+    params = {"q": q} if q is not None else None
+    try:
+        resp = await app.state.http.get(EXTERNAL_API_URL, params=params)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+
+    # Forward simple JSON si possible, sinon texte
+    content_type = resp.headers.get("content-type", "")
+    if "application/json" in content_type:
+        return resp.json()
+    try:
+        return json.loads(resp.text)
+    except json.JSONDecodeError:
+        return {"status_code": resp.status_code, "body": resp.text}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+# Optionnel: petit test local de concurrence (à exécuter manuellement)
+async def _smoke_test_concurrency(n: int = 100):
+    async with httpx.AsyncClient() as client:
+        async def hit():
+            r = await client.get("http://127.0.0.1:8000/proxy")
+            return r.status_code
+
+        t0 = asyncio.get_event_loop().time()
+        statuses = await asyncio.gather(*[hit() for _ in range(n)])
+        dt = asyncio.get_event_loop().time() - t0
+        print(f"{n} requêtes terminées en {dt:.2f}s, codes: {set(statuses)}")
+
+# Pour lancer:
+# uvicorn this_file:app --host 0.0.0.0 --port 8000
+# Puis bombarder /proxy avec 100 requêtes simultanées.
