@@ -1,0 +1,103 @@
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import time
+from typing import Iterable, List, Tuple
+
+import requests
+import numpy as np
+from matplotlib import pyplot as plt
+
+
+DOG_API_URL = "https://dog.ceo/api/breeds/image/random"
+
+
+def http_fetch(_: int) -> Tuple[float, float]:
+    """
+    Effectue un appel HTTP vers l'API dog.ceo et renvoie (start, stop) en secondes.
+    Note: crée une session locale au worker (threads : partagent GIL mais OK pour I/O;
+    process : chaque process a sa propre session, évite le partage cross-process).
+    """
+    start = time.perf_counter()
+    session = requests.Session()
+    try:
+        resp = session.get(DOG_API_URL, timeout=10)
+        resp.raise_for_status()
+        _ = resp.json()  # on force l'I/O JSON pour simuler le cas réel
+    except requests.RequestException as e:
+        # On mesure tout de même le temps pour visualiser l'échec
+        stop = time.perf_counter()
+        # Log simple sur stderr (print), mais on continue
+        print(f"HTTP error: {e}")
+        return start, stop
+    finally:
+        session.close()
+    stop = time.perf_counter()
+    return start, stop
+
+
+def multithreading(func, args: Iterable[int], workers: int) -> List[Tuple[float, float]]:
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(func, args))
+
+
+def multiprocessing(func, args: Iterable[int], workers: int) -> List[Tuple[float, float]]:
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(func, args))
+
+
+def visualize_runtimes(results: List[Tuple[float, float]], title: str = None):
+    # Crée une nouvelle figure pour chaque jeu de résultats
+    fig, ax = plt.subplots(figsize=(10, 4))
+    arr = np.array(results, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        raise ValueError("Les résultats doivent être une liste de paires (start, stop).")
+    start, stop = arr.T
+    # Normaliser l'origine temporelle pour une meilleure lecture (t0 = min start)
+    t0 = float(np.min(start)) if len(start) else 0.0
+    start -= t0
+    stop -= t0
+
+    ax.barh(range(len(start)), stop - start, left=start, height=0.8, color="#4C78A8")
+    ax.grid(axis="x", linestyle="--", alpha=0.5)
+    ax.set_ylabel("Tâches")
+    ax.set_xlabel("Secondes (origine normalisée)")
+    if title:
+        ax.set_title(title)
+    return fig, ax
+
+
+def run_and_measure(executor_name: str, executor_fn, n: int, workers: int):
+    print(f"\n=== {executor_name}: {n} requêtes, workers={workers} ===")
+    t0 = time.perf_counter()
+    results = executor_fn(http_fetch, range(n), workers)
+    total = time.perf_counter() - t0
+    print(f"Durée totale: {total:.2f} s")
+    # Statistiques simples
+    arr = np.array(results, dtype=float)
+    durations = arr[:, 1] - arr[:, 0]
+    print(f"Durée min/mediane/max d'une requête: {durations.min():.2f} / "
+          f"{np.median(durations):.2f} / {durations.max():.2f} s")
+    return results, total
+
+
+if __name__ == "__main__":
+    N = 100
+    # Pour I/O-bound HTTP, beaucoup de threads fonctionnent bien (p.ex. 100)
+    THREAD_WORKERS = 100
+    # Les process sont moins utiles ici (I/O) et plus coûteux; on en met 8-16 pour comparer
+    PROCESS_WORKERS = 8
+
+    # Threads
+    thread_results, thread_total = run_and_measure(
+        "Multithreading", multithreading, N, THREAD_WORKERS
+    )
+    visualize_runtimes(thread_results, title=f"Multithreading - {N} appels (total ~ {thread_total:.2f}s)")
+
+    # Processus
+    process_results, process_total = run_and_measure(
+        "Multiprocessing", multiprocessing, N, PROCESS_WORKERS
+    )
+    visualize_runtimes(process_results, title=f"Multiprocessing - {N} appels (total ~ {process_total:.2f}s)")
+
+    # Affiche les deux graphiques
+    plt.tight_layout()
+    plt.show()
