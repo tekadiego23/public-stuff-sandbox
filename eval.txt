@@ -69,3 +69,32 @@ async def _smoke_test_concurrency(n: int = 100):
 # Pour lancer:
 # uvicorn this_file:app --host 0.0.0.0 --port 8000
 # Puis bombarder /proxy avec 100 requêtes simultanées.
+
+
+
+# filename: bombard_async.py
+import asyncio
+import time
+import httpx
+
+URL = "http://127.0.0.1:8000/dog/random"
+
+async def main(n: int = 100):
+    async with httpx.AsyncClient(timeout=10.0, http2=True) as client:
+        async def hit(i: int):
+            r = await client.get(URL)
+            r.raise_for_status()
+            return r.json()["status"], i
+
+        t0 = time.perf_counter()
+        results = await asyncio.gather(*[hit(i) for i in range(n)], return_exceptions=True)
+        dt = time.perf_counter() - t0
+
+    ok = sum(1 for r in results if not isinstance(r, Exception) and r[0] == "success")
+    err = [r for r in results if isinstance(r, Exception)]
+    print(f"{n} requêtes terminées en {dt:.2f}s | succès: {ok} | erreurs: {len(err)}")
+    if err:
+        print(f"Exemples d’erreurs: {err[:3]}")
+
+if __name__ == "__main__":
+    asyncio.run(main(100))
