@@ -1,0 +1,155 @@
+Hi all,
+
+TL;DR: We converted our FastAPI endpoints to async and replaced blocking HTTP calls with a re-usable async HTTP client. Under load (100 concurrent requests), all calls now complete in ~3s with stable latency and no visible queuing.
+
+1) What was blocking
+
+Endpoints were def and used requests (blocking) to call the pricing service.
+
+Each worker was stuck ~3s waiting on network I/O, which led to:
+
+wasted CPU and heavy context switching,
+
+latency spikes when bursts arrived,
+
+high p95/p99 compared to p50.
+
+Before:
+
+def job_results(...):
+    response = pricer._client._session.get(url)  # blocking
+    return response.json()
+
+2) What we changed
+
+Migrated endpoints to async def.
+
+Switched to httpx.AsyncClient.
+
+Created a single, reusable client at app startup (connection pooling, keep-alive) and close it on shutdown:
+
+max_keepalive_connections=200
+
+max_connections=200
+
+explicit timeouts.
+
+External calls are now await http.get/post(...).
+
+Reduced per-request logging overhead.
+
+After:
+
+@app.on_event("startup")
+async def on_startup():
+    app.state.http = httpx.AsyncClient(
+        limits=httpx.Limits(max_keepalive_connections=200, max_connections=200),
+        timeout=httpx.Timeout(10.0, connect=5.0)
+    )
+
+async def job_results(...):
+    response = await request.app.state.http.get(url)  # non-blocking
+    return response.json()
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await app.state.http.aclose()
+
+3) Measured impact
+
+100 simultaneous calls to the endpoint: all complete ≈3 seconds (tight spread), with stable tail latency and no backlog.
+
+Better resource utilization; less process overhead.
+
+4) Clear next steps
+
+Right-size worker count
+Current formula yields ~120 workers on the c2-standard-60; that’s excessive and memory-heavy. Recommend 8–16 workers to start, then tune by measurement.
+
+Back-pressure & resilience
+
+Cap in-flight work (--limit-concurrency / semaphore) to protect downstreams.
+
+Standardize timeouts and add retries with jitter for transient errors only.
+
+Observability
+
+Track p50/p95/p99, RPS, error rates, queue time, and pool metrics (via OpenTelemetry dashboard).
+
+Alert on timeouts and pool saturation.
+
+Regular load tests
+
+Target: p95 ≤ 3.5s for 100 concurrent calls on the critical endpoint.
+
+For CPU-bound tasks
+
+Offload to a worker/job queue (e.g., Celery) rather than blocking the web path.
+
+Consider horizontal autoscaling based on latency/saturation.
+
+5) Business impact
+
+More predictable UX during peaks.
+
+Higher burst capacity without degradation.
+
+Potential cost savings (fewer workers for the same throughput).
+
+Happy to walk through the changes and confirm the worker sizing and dashboards.
+
+Thanks,
+[Your Name]
+
+Vous avez dit :
+Explain why 8-16 workers will do the job 
+ChatGPT a dit :
+Réflexion durant 1m 18s
+
+Here’s the short, practical why:
+
+Concurrency now comes from async, not worker count.
+Each Uvicorn worker runs an event loop. With async def + httpx.AsyncClient, a single worker can keep hundreds of in-flight requests waiting on I/O. Workers are no longer the bottleneck.
+
+CPU math says we need only a few cores.
+A 3-second request that is mostly I/O usually spends <20–100 ms of real CPU (JSON parse/serialize, routing, logging).
+For 100 concurrent requests:
+
+CPU needed ≈ 100 × 0.02–0.10 s / 3 s = 0.7–3.3 CPU cores.
+On a c2-standard-60 (60 vCPUs), that’s a rounding error. 8–16 workers already gives you far more CPU headroom than required.
+
+Too many workers hurts throughput.
+120 processes mean:
+
+more context switching and cache thrash,
+
+large memory footprint (loading the whole app per process),
+
+slower startup/rollouts, and
+
+a “thundering herd” of connections to downstream services.
+
+Downstream safety.
+Each worker has its own HTTP connection pool. With 120 workers and max_connections=200, you could open 24,000 outbound sockets, overwhelming the pricing service. With 8–16 workers, total concurrency is easier to cap (and you can scale max_connections to a sane overall limit).
+
+Resilience without waste.
+8–16 processes:
+
+provide fault isolation (if one blocks/crashes, the app keeps serving),
+
+use multiple cores for small CPU spikes (Pydantic, JSON, TLS),
+
+are easy to autoscale horizontally if needed.
+
+Rule of thumb for this app
+
+Start with 8–16 Uvicorn/Gunicorn workers on the 60-vCPU box.
+
+Keep max_connections per worker modest so that total outbound concurrency matches what downstreams can handle (e.g., 25 per worker ⇒ 8 workers × 25 = 200 total).
+
+Optionally add --limit-concurrency (server-side back-pressure).
+
+When to go above 16?
+Only if endpoints become CPU-bound (heavy computation) or profiling shows high per-request CPU (≫100 ms). In that case, add CPU workers or offload compute to a job queue; don’t just crank worker count blindly.
+
+Bottom line: for an I/O-bound FastAPI service with ~3 s responses and bursts of ~100 concurrent calls, 8–16 workers deliver the same latency with less memory, less contention, and safer downstream pressure—while leaving huge headroom on a 60-vCPU machine.
