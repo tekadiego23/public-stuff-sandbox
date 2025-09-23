@@ -1,0 +1,81 @@
+import asyncio
+import aiohttp
+import pandas as pd
+
+# Exemple de base URLs pour tes configs
+CONFIGS = {
+    "prod": "https://api.prod.com",
+    "prod-2": "https://api.prod2.com",
+    "prod-3": "https://api.prod3.com",
+    "ppe": "https://api.ppe.com"
+}
+
+# Supposons que tu as déjà cette structure :
+# { "prod": { "1d_var": ["s1", "s2"], "svar": ["s3", "s4"] }, ... }
+ENVS_SESSIONS = {
+    "prod": {
+        "1d_var": ["s1", "s2"],
+        "svar": ["s3", "s4"]
+    },
+    "prod-2": {
+        "10duvar": ["s5", "s6"]
+    }
+    # etc...
+}
+
+async def fetch_metrics(session, url, config, env_id, session_id):
+    """Récupère les métrics d'une session donnée"""
+    try:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            # On enrichit les données avec le contexte (config/env/session)
+            return {
+                "config": config,
+                "env_id": env_id,
+                "session_id": session_id,
+                "metrics": data
+            }
+    except Exception as e:
+        print(f"Erreur pour {url}: {e}")
+        return None
+
+async def gather_all_metrics():
+    tasks = []
+    async with aiohttp.ClientSession() as http_session:
+        for config, base_url in CONFIGS.items():
+            for env_id, sessions in ENVS_SESSIONS.get(config, {}).items():
+                for session_id in sessions:
+                    url = f"{base_url}/{env_id}/sessions/{session_id}/bulkmetrics"
+                    tasks.append(
+                        fetch_metrics(http_session, url, config, env_id, session_id)
+                    )
+        results = await asyncio.gather(*tasks)
+        return [r for r in results if r is not None]
+
+def build_dataframe(metrics_list):
+    """Transforme les métrics récupérés en DataFrame"""
+    rows = []
+    for entry in metrics_list:
+        config = entry["config"]
+        env_id = entry["env_id"]
+        session_id = entry["session_id"]
+        metrics = entry["metrics"]
+
+        # Aplatir les métrics si c'est un dict
+        if isinstance(metrics, dict):
+            flat = {**metrics, "config": config, "env_id": env_id, "session_id": session_id}
+            rows.append(flat)
+        else:
+            rows.append({
+                "config": config,
+                "env_id": env_id,
+                "session_id": session_id,
+                "metrics": metrics
+            })
+    return pd.DataFrame(rows)
+
+if __name__ == "__main__":
+    metrics_list = asyncio.run(gather_all_metrics())
+    df = build_dataframe(metrics_list)
+    print(df.head())
