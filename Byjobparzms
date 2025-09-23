@@ -1,0 +1,135 @@
+import asyncio
+import random
+from typing import Dict, List, Any, Optional
+
+import aiohttp
+import pandas as pd
+
+# ---- À RENSEIGNER -----------------------------------------------------------
+CONFIGS: Dict[str, str] = {
+    "prod":   "https://api.prod.com",
+    "prod-2": "https://api.prod2.com",
+    "prod-3": "https://api.prod3.com",
+    "ppe":    "https://api.ppe.com",
+}
+
+# Exemple : { "prod": { "1d_var": ["s1","s2"], "svar": ["s3"] }, "prod-2": {...}, ... }
+ENVS_SESSIONS: Dict[str, Dict[str, List[str]]] = {
+    # ...
+}
+
+# 👉 tes 2 query params (remplace par tes clés/valeurs réelles)
+EXTRA_PARAMS: Dict[str, Any] = {
+    "param1": "value1",
+    "param2": "value2",
+}
+
+# Optionnel : si tu as un token/bearer ou autre
+DEFAULT_HEADERS = {
+    # "Authorization": "Bearer <TOKEN>",
+    "Accept": "application/json",
+}
+# -----------------------------------------------------------------------------
+
+
+# === Réseau asynchrone & robustesse ==========================================
+MAX_CONCURRENCY = 32       # limite de requêtes simultanées (ajuste selon ton API)
+MAX_RETRIES = 4            # retries par requête
+INITIAL_BACKOFF = 0.5      # secondes
+TIMEOUT = aiohttp.ClientTimeout(total=30, connect=5, sock_read=25)
+
+_sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
+async def _sleep_backoff(attempt: int) -> None:
+    # backoff exponentiel + jitter
+    delay = INITIAL_BACKOFF * (2 ** attempt) + random.random() * 0.2
+    await asyncio.sleep(delay)
+
+async def fetch_one(
+    session: aiohttp.ClientSession,
+    url: str,
+    params: Dict[str, Any],
+    context: Dict[str, str],
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Retourne la liste de 'records' pour une (config, env, session).
+    Enrichit chaque record avec le contexte.
+    """
+    async with _sem:
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with session.get(url, params=params) as resp:
+                    # lève sur codes 4xx/5xx
+                    resp.raise_for_status()
+                    data = await resp.json(content_type=None)
+                    records = data.get("records", [])
+
+                    # normalisation défensive
+                    if not isinstance(records, list):
+                        records = [records]
+
+                    # enrichit chaque record avec les tags contextuels
+                    enriched = [{**rec, **context} for rec in records]
+                    return enriched
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                # Réessaie sur erreurs réseau/timeout (sauf dernier essai)
+                if attempt < MAX_RETRIES - 1:
+                    await _sleep_backoff(attempt)
+                    continue
+                else:
+                    # Log minimal et on n’arrête pas tout le batch
+                    print(f"[WARN] {url} -> {type(e).__name__}: {e}")
+                    return None
+
+async def gather_all(
+    configs: Dict[str, str],
+    envs_sessions: Dict[str, Dict[str, List[str]]],
+    extra_params: Dict[str, Any],
+    headers: Dict[str, str],
+) -> pd.DataFrame:
+    """
+    Envoie toutes les requêtes en parallèle et retourne un DataFrame unique.
+    """
+    connector = aiohttp.TCPConnector(limit=0, enable_cleanup_closed=True)
+    tasks = []
+
+    async with aiohttp.ClientSession(
+        timeout=TIMEOUT, connector=connector, headers=headers, raise_for_status=False
+    ) as http:
+        for config, base_url in configs.items():
+            for env_id, sessions in envs_sessions.get(config, {}).items():
+                for sid in sessions:
+                    url = f"{base_url}/{env_id}/sessions/{sid}/bulkmetrics"
+                    ctx = {"config": config, "env_id": env_id, "session_id": sid}
+                    tasks.append(fetch_one(http, url, extra_params, ctx))
+
+        # ⚡️ toutes les metrics sont demandées en même temps
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+    # Flatten des listes de records (et on ignore les None)
+    all_records: List[Dict[str, Any]] = []
+    for part in results:
+        if part:
+            all_records.extend(part)
+
+    if not all_records:
+        return pd.DataFrame()  # rien reçu
+
+    # json_normalize pour aplatir proprement
+    df = pd.json_normalize(all_records, sep=".")
+    # colonnes contextuelles déjà fusionnées; tu peux re-ordonner si besoin :
+    front_cols = [c for c in ["config", "env_id", "session_id"] if c in df.columns]
+    other_cols = [c for c in df.columns if c not in front_cols]
+    df = df[front_cols + other_cols]
+    return df
+
+
+# === Exemple d’utilisation ====================================================
+if __name__ == "__main__":
+    df = asyncio.run(gather_all(CONFIGS, ENVS_SESSIONS, EXTRA_PARAMS, DEFAULT_HEADERS))
+    # Persistance (au choix)
+    # df.to_parquet("metrics.parquet", index=False)
+    # df.to_csv("metrics.csv", index=False)
+    print(df.shape)
+    print(df.head(3))
