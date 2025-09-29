@@ -138,3 +138,85 @@ async def group_positions_by_instrument(
         for product in position.get("products", []):
             product_id = product.get("id", {}).get("sophis", "")
             if not product_id:
+                continue
+            pf_id = position.get("portfolioId", {}).get("sophis", "")
+            if pf_id:
+                portfolio_ids.add(pf_id)
+                instrument_ids.add(product_id)
+                _ = grouped[f'sophis/{product_id}']["epi"]  # force la clé
+
+    # Préloads bornés par le sémaphore
+    await prefetch_portfolios_or_instruments(session, pf_detail_base_url, list(portfolio_ids), max_workers=MAX_WORKER_THREADS)
+    await prefetch_portfolios_or_instruments(session, instrument_detail_url, list(instrument_ids), max_workers=MAX_WORKER_THREADS)
+
+    # ... (complète 'grouped' depuis les caches si besoin)
+    return grouped
+
+# =====================================================================
+# Fonction principale (exemple) — garde ta logique et tes signatures
+# =====================================================================
+
+# On suppose que env_config[...] existe déjà quelque part dans ton code.
+# get_positions_from_folio_hierarchy_v2(cutoff, cob_date, portfolios, env="ppe")
+async def get_positions_from_folio_hierarchy_v2(
+    cutoff: str,
+    cob_date: str,
+    portfolios: List[str],
+    env: str = "ppe",
+):
+    """
+    Fetch and process positions from the folio hierarchy in parallel.
+    Logique inchangée, bascule vers aiohttp + aiohttp_retry.
+    """
+    global USER_NAME, PASSWORD
+    USER_NAME = env_config[env]["username"]
+    PASSWORD = env_config[env]["password"]
+    cs_base_url = env_config[env]["cs_base_url"]
+
+    pfh_document_type = "Trades.Portfolio"
+    pf_detail_document_type = "Trades.PortfolioHierarchyResult"
+    instrument_detail_document_type = "Static.InstrumentRefData"
+
+    auth = BasicAuth(USER_NAME, PASSWORD)
+
+    # Session de base + RetryClient
+    base_session = ClientSession(
+        auth=auth,
+        timeout=TIMEOUT,
+        connector=CONNECTOR,
+        trust_env=True,  # utile si variables proxy
+    )
+
+    async with RetryClient(
+        client_session=base_session,
+        retry_options=RETRY,
+        raise_for_status=False,  # on lèvera après chaque requête
+    ) as session:
+
+        async def process_portfolio(portfolio: str):
+            url = (
+                f'{cs_base_url}/{cutoff}@{cob_date}/{pfh_document_type}/sophis/{portfolio}'
+                f'/TREE/PRODUCT_ALL/CASH_NONE'
+            )
+            try:
+                response = await fetch_url(session, url)
+                pf_detail_url = (
+                    f'{cs_base_url}/{cutoff}@{cob_date}/{pf_detail_document_type}/sophis/'
+                )
+                instrument_detail_url = (
+                    f'{cs_base_url}/{cutoff}@{cob_date}/{instrument_detail_document_type}/sophis/'
+                )
+                position_retrieved = extract_positions(response)
+                grouped_positions = await group_positions_by_instrument(
+                    position_retrieved, pf_detail_url, instrument_detail_url, session
+                )
+                return grouped_positions
+            except Exception as err:
+                # Même logique que ta version d’origine
+                raise HTTPException(status_code=500, detail=str(err))
+
+        tasks = [process_portfolio(p) for p in portfolios]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        positions_by_instruments = [r for r in results if not isinstance(r, Exception)]
+        return positions_by_instruments
