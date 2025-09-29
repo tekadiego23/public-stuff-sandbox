@@ -1,0 +1,140 @@
+# ---------------------------
+# aiohttp + aiohttp_retry patch
+# ---------------------------
+import asyncio
+import time
+from typing import Dict, Any, List
+from collections import defaultdict
+
+import aiohttp
+from aiohttp import ClientSession, BasicAuth
+from aiohttp_retry import RetryClient, ExponentialRetry
+
+# Si tu utilises FastAPI/Starlette pour lever des erreurs HTTP
+try:
+    from fastapi import HTTPException
+except Exception:
+    class HTTPException(Exception):
+        def __init__(self, status_code: int, detail: str):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+# =====================================================================
+# Réglages de pool/timeout/retry — adapter selon la capacité du backend
+# =====================================================================
+
+# Concurrence logique (borne des coroutines actives)
+MAX_WORKER_THREADS = 300  # bon point de départ pour ~1000 appels
+
+# Pool TCP
+CONNECTOR = aiohttp.TCPConnector(
+    limit=600,            # plafond global de connexions (≈ 2x MAX_WORKER_THREADS)
+    limit_per_host=0,     # pas de plafond par host (mets 200 si multi-host sensible)
+    ttl_dns_cache=60,
+    keepalive_timeout=60,
+    enable_cleanup_closed=True,
+    # ssl=False,          # décommente si tu DOIS désactiver SSL (évite si possible)
+)
+
+# Timeouts
+TIMEOUT = aiohttp.ClientTimeout(
+    total=30,     # délai global par requête
+    connect=5,    # temps pour établir la connexion
+    sock_connect=5,
+    sock_read=30,
+)
+
+# Politique de retry exponentiel (statuts/erreurs transitoires)
+RETRY = ExponentialRetry(
+    attempts=8,
+    start_timeout=0.25,
+    factor=2.0,
+    max_timeout=15.0,
+    statuses={429, 500, 502, 503, 504},
+    exceptions={aiohttp.ClientError, asyncio.TimeoutError},
+)
+
+# =====================================================================
+# Caches globaux (si tu les as déjà, garde les tiens)
+# =====================================================================
+PORTFOLIO_CACHE: Dict[str, Any] = {}
+INSTRUMENT_CACHE: Dict[str, Any] = {}
+
+# =====================================================================
+# Utilitaires spécifiques à ton domaine (bouchons si non présents ici)
+# =====================================================================
+def extract_positions(response_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Remplace par ta vraie extraction; laissé ici pour être self-contained."""
+    return response_json.get("positions", []) if isinstance(response_json, dict) else []
+
+# =====================================================================
+# HTTP helpers (AIOHTTP + AIOHTTP_RETRY)
+# =====================================================================
+
+async def fetch_url(
+    session: RetryClient,
+    url: str,
+    max_retry_time: float = 60.0,  # conservé pour compat; géré par aiohttp_retry
+    backoff_factor: float = 0.5    # idem
+) -> Dict[str, Any]:
+    """
+    GET JSON avec retries gérés par aiohttp_retry.
+    """
+    params = {"encoding": "json"}
+    async with session.get(url, params=params) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+async def prefetch_portfolios_or_instruments(
+    session: RetryClient,
+    base_url: str,
+    portfolio_or_instruments_ids: List[str],
+    max_workers: int = MAX_WORKER_THREADS
+):
+    """
+    Précharge les détails uniques dans le cache correspondant.
+    return: dict {id: json}
+    """
+    is_portfolio_request = "Trades.Portfolio" in base_url
+    CACHE_TO_USE = PORTFOLIO_CACHE if is_portfolio_request else INSTRUMENT_CACHE
+
+    missing = [id_ for id_ in portfolio_or_instruments_ids if id_ not in CACHE_TO_USE]
+    if not missing:
+        return CACHE_TO_USE
+
+    limiter = asyncio.Semaphore(max_workers)
+
+    async def process_details(id_: str):
+        async with limiter:
+            url = f"{base_url}{id_}"
+            try:
+                data = await fetch_url(session, url)
+                CACHE_TO_USE[id_] = data
+            except Exception as e:
+                # On n'échoue pas tout le batch : placeholder vide
+                print(f"[WARN] error fetching {id_}: {e}")
+                CACHE_TO_USE[id_] = {}
+
+    await asyncio.gather(*(process_details(i) for i in missing), return_exceptions=True)
+    return CACHE_TO_USE
+
+async def group_positions_by_instrument(
+    positions,
+    pf_detail_base_url,
+    instrument_detail_url,
+    session: RetryClient
+):
+    """
+    1) collecte les ids uniques
+    2) précharge caches
+    3) regroupe (ta logique interne ensuite)
+    """
+    portfolio_ids: set = set()
+    instrument_ids: set = set()
+    grouped = defaultdict(lambda: {"epi": {}, "hmsBook": "", "legalEntity": "", "desk": ""})
+
+    for position in positions:
+        for product in position.get("products", []):
+            product_id = product.get("id", {}).get("sophis", "")
+            if not product_id:
