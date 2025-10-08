@@ -1,0 +1,77 @@
+import logging
+from functools import lru_cache
+
+@timelit("logger")
+@create_telemetry_span
+def stress_test(self, rn: RootNode, result: Optional[RootNode] = None) -> RootNode:
+    # --- raccourcis locaux (réduisent les lookups Python dans les fonctions appelées)
+    req = rn.stress_test_request.ukspa
+    res = result or RootNode()
+
+    # 1) validation
+    self.validate_request(rn)
+
+    # 2) récupérer le produit sans branchements coûteux à l’exécution
+    product = getattr(req, "product", None)
+    if product is None:
+        product = rn.stress_test_request.ukspa.pricing_request.context.statics.products[0]
+
+    # 3) MARKET DATA (éviter les copies et activer un cache)
+    add_event_to_span("Fetching market data")
+    md = _get_ukspa_market_data_cached(
+        product_id=_product_id(product),
+        rd=self.rd, cc=self.cc, dc=self.dc, cn=self.cn, sn=self.sn
+    )
+
+    # immutable -> pas de copy(); plus léger à hasher/cacher et à passer aux fonctions Numpy/numba
+    underlyings_bbg = tuple(md.underlying_names)
+    dates = get_dates_for_product(product)
+
+    # 4) LOGGING paresseux
+    if logger.isEnabledFor(logging.INFO):
+        logger.info("N of underlyings: %d", len(underlyings_bbg))
+        logger.info("N of dates: %d", len(dates))
+        logger.info("N of scenarios: %d", len(req.scenarios))
+
+    # 5) MONTE CARLO (donner tous les paramètres => possibilité de vectoriser/paralleliser)
+    add_event_to_span("Generating Paths")
+    paths_per_scenario = ukspa_simulate(
+        rn=rn,
+        md=md,
+        dates=dates,
+        scenarios=req.scenarios,   # évite que la fonction relise rn
+        num_paths=req.num_paths,
+        parallel=True,             # si supporté : thread/numba/jit/prange
+        dtype="float32",           # 2x moins de mémoire, souvent plus rapide
+        rng="mt19937",             # déterministe et rapide
+    )
+
+    # 6) PAYOFF
+    add_event_to_span("Compute Cashflows based on Paths")
+    life_cycling = paths_to_cashflows(
+        paths_per_scenario,
+        req.num_paths,
+        product,
+        underlyings_bbg,
+        vectorized=True,           # si supporté : pas de boucles Python
+        parallel=True,             # si supporté
+    )
+
+    # 7) STATS
+    add_event_to_span("Compute Test Statistics")
+    ukspa_generate_stats(rn, product, life_cycling, res)
+
+    return res
+
+
+# ----------- Helpers de perf -----------
+def _product_id(product) -> str:
+    """Identifiant stable pour le cache (éviter de mettre l'objet complet dans la clé)."""
+    # adapte selon ton modèle (ISIN, code interne, etc.)
+    return getattr(product, "id", repr(product))
+
+@lru_cache(maxsize=64)
+def _get_ukspa_market_data_cached(*, product_id, rd, cc, dc, cn, sn):
+    # IMPORTANT : ne mets dans la clé cache que des scalaires/tuples immutables
+    md = ukspa_market_data(product_id, rd, cc, dc, cn, sn)
+    return md
