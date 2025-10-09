@@ -1,44 +1,129 @@
-# billing_by_position.py  (EXTRAIT REFACTO)
+#!/usr/bin/env python3
+# parallel_post.py
+import argparse
+import concurrent.futures as cf
+import json
+import time
+from typing import Optional, Tuple
 
-import pandas as pd
-import numpy as np
-from contextstore_async import set_positions_concurrent
+import requests
+from requests.adapters import HTTPAdapter
+try:
+    # urllib3 v2
+    from urllib3.util import Retry
+    RETRY_KW = dict(allowed_methods=frozenset(["POST"]))
+except Exception:
+    # compat v1
+    from urllib3.util.retry import Retry  # type: ignore
+    RETRY_KW = dict(method_whitelist=frozenset(["POST"]))  # deprecated but ok for v1
 
-async def get_positions_cost(by_job_df: pd.DataFrame) -> pd.DataFrame:
-    # 1) Enrichir via snaps_definition → transforme en table puis MERGE (au lieu de apply)
-    snaps_definition = json.loads(await get_variables("snaps_definition", "ppe"))
-    snaps_map = pd.DataFrame(snaps_definition)  # doit contenir les clés pour joindre
-    by_job_df = by_job_df.merge(snaps_map, how="left", left_on="job_snap", right_on="job_snap")
-
-    # 2) Fetch positions en CONCURRENCE (async)
-    #    -> renvoie un DF PLAT : une ligne par instrument/portfolio pour chaque job
-    by_job_positions = await set_positions_concurrent(
-        by_job_df,
-        cs_base_url = env_config["cs_base_url"],            # adapte
-        pf_detail_base_url = env_config["pf_detail_base_url"],
-        instrument_detail_base_url = env_config["inst_detail_base_url"],
-        auth=None,  # ou ton auth
+def make_session(max_retries: int, timeout: float, pool_size: int) -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=max_retries,
+        connect=max_retries,
+        read=max_retries,
+        backoff_factor=0.5,              # 0.5s, 1s, 2s...
+        status_forcelist=[500, 502, 503, 504],
+        **RETRY_KW
     )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=pool_size, pool_maxsize=pool_size)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.request_timeout = timeout  # juste pour garder la valeur à portée
+    return s
 
-    # 3) Calculs vectorisés (pas d’apply):
-    #    a) temps de compute par instrument (tu as déjà instrument_computation_time)
-    #       Suppose qu’on a une colonne instrument_computation_time au niveau instrument
-    #       Sinon calcule-la à partir des réponses amont.
+def do_post(session: requests.Session, idx: int, url: str, headers: dict, data: Optional[str],
+            json_body: Optional[dict]) -> Tuple[int, Optional[int], Optional[int], Optional[str]]:
+    try:
+        resp = session.post(
+            url,
+            headers=headers or None,
+            data=data if (data is not None and json_body is None) else None,
+            json=json_body if json_body is not None else None,
+            timeout=session.request_timeout,
+        )
+        # on lit le contenu pour fermer proprement la connexion
+        content_len = len(resp.content) if resp.content is not None else 0
+        return idx, resp.status_code, content_len, None
+    except Exception as e:
+        return idx, None, None, str(e)
 
-    #    b) nb_positions_for_instruments -> c’est déjà 'n_epi' dans le DF plat
-    by_job_positions["position_computation_time"] = (
-        by_job_positions["instrument_computation_time"] / by_job_positions["n_epi"].replace(0, np.nan)
-    ).fillna(0)
+def parse_kv_pairs(pairs: list[str]) -> dict:
+    out = {}
+    for p in pairs:
+        if ":" in p:
+            k, v = p.split(":", 1)
+        elif "=" in p:
+            k, v = p.split("=", 1)
+        else:
+            raise ValueError(f"En-tête invalide: {p!r} (utilisez key:value)")
+        out[k.strip()] = v.strip()
+    return out
 
-    #    c) somme par job (groupby)
-    g = (by_job_positions
-         .drop_duplicates(subset=["job_id","instrument_id"])
-         .groupby("job_id", as_index=False)["instrument_computation_time"].sum()
-         .rename(columns={"instrument_computation_time":"sum_instrument_time"}))
+def main():
+    ap = argparse.ArgumentParser(description="Envoyer X requêtes POST en parallèle avec requests.")
+    ap.add_argument("url", help="URL de destination")
+    ap.add_argument("-n", "--num", type=int, default=10, help="Nombre total de requêtes (défaut: 10)")
+    ap.add_argument("-w", "--workers", type=int, default=None, help="Nombre de threads (défaut: min(32, n))")
+    ap.add_argument("--timeout", type=float, default=10.0, help="Timeout par requête en secondes (défaut: 10)")
+    ap.add_argument("--retries", type=int, default=2, help="Nombre de retries par requête (défaut: 2)")
+    ap.add_argument("--header", "-H", action="append", default=[],
+                    help='En-têtes HTTP "Clé:Valeur". Peut être répété.')
+    grp = ap.add_mutually_exclusive_group()
+    grp.add_argument("--data", help="Corps brut (form-urlencoded/texte).")
+    grp.add_argument("--json", dest="json_body", help="Corps JSON (string JSON ou chemin fichier .json)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="Affiche chaque résultat individuellement.")
+    args = ap.parse_args()
 
-    by_job_positions = by_job_positions.merge(g, on="job_id", how="left")
+    headers = parse_kv_pairs(args.header) if args.header else {}
 
-    # 4) Explode EPI : tu as déjà un DF plat; si tu dois exploser une list epi_list, fais-le ici
-    # by_job_positions = by_job_positions.explode("epi_list", ignore_index=True)
+    # Prépare le body JSON si demandé
+    json_payload = None
+    if args.json_body:
+        if args.json_body.strip().startswith("{") or args.json_body.strip().startswith("["):
+            json_payload = json.loads(args.json_body)
+        else:
+            with open(args.json_body, "r", encoding="utf-8") as f:
+                json_payload = json.load(f)
 
-    return by_job_positions
+        # Ajoute l'en-tête si absent
+        headers.setdefault("Content-Type", "application/json")
+
+    workers = args.workers or min(32, args.num)
+    session = make_session(max_retries=args.retries, timeout=args.timeout, pool_size=workers)
+
+    start = time.perf_counter()
+    results = []
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [
+            ex.submit(do_post, session, i, args.url, headers, args.data, json_payload)
+            for i in range(args.num)
+        ]
+        for fut in cf.as_completed(futures):
+            idx, status, size, err = fut.result()
+            results.append((idx, status, size, err))
+            if args.verbose:
+                if err:
+                    print(f"[{idx:04d}] ERROR: {err}")
+                else:
+                    print(f"[{idx:04d}] {status} ({size} bytes)")
+
+    elapsed = time.perf_counter() - start
+
+    ok = sum(1 for _, s, _, e in results if s and 200 <= s < 300 and not e)
+    by_status = {}
+    for _, s, _, e in results:
+        key = f"ERR:{e.split(':',1)[0]}" if e else str(s)
+        by_status[key] = by_status.get(key, 0) + 1
+
+    print("\n=== Récapitulatif ===")
+    print(f"URL: {args.url}")
+    print(f"Envoyées: {args.num}  |  Succès (2xx): {ok}  |  Threads: {workers}")
+    print("Par statut/erreur:")
+    for k in sorted(by_status):
+        print(f"  {k}: {by_status[k]}")
+    print(f"Durée totale: {elapsed:.2f}s  |  RPS approx: {args.num/elapsed:.2f} req/s")
+
+if __name__ == "__main__":
+    main()
