@@ -1,0 +1,60 @@
+rest_response = get_all_proto()                 # your big dict
+instrument_index = build_instrument_index(rest_response)
+
+# now apply with fast O(1) lookups per row
+df_exploded_by_instrument["instrument_computation_time"] = (
+    df_exploded_by_instrument["pv_stat_id"]
+      .map(lambda k: get_task_pl_calc_time_from_pv_stat_response(k, rest_response, instrument_index))
+)
+
+import json
+import numpy as np
+
+# -------- helpers
+def _as_dict(x):
+    if isinstance(x, dict):
+        return x
+    if x in ("", None):
+        return {}
+    try:
+        return json.loads(x)           # safer/faster than eval if payload is JSON
+    except Exception:
+        return {}
+
+def _extract_instrument_id(key: str):
+    # get the value right after '#sophis#'
+    i = key.find("#sophis#")
+    if i == -1:
+        return None
+    i += len("#sophis#")
+    j = key.find("#", i)
+    return key[i:] if j == -1 else key[i:j]
+
+def build_instrument_index(rest_response: dict) -> dict:
+    """Map instrument_id -> first pv_stat_id key seen."""
+    idx = {}
+    for k in rest_response.keys():
+        inst = _extract_instrument_id(k)
+        if inst and inst not in idx:
+            idx[inst] = k
+    return idx
+# -------- main lookup
+
+def get_task_pl_calc_time_from_pv_stat_response(pv_stat_id: str,
+                                                rest_response: dict,
+                                                instrument_index: dict) -> float:
+    # 1) exact hit
+    d = _as_dict(rest_response.get(pv_stat_id))
+    if d:
+        return d.get("taskPLCalcTime", np.nan)
+
+    # 2) O(1) fallback via index
+    inst = _extract_instrument_id(pv_stat_id or "")
+    if inst:
+        k = instrument_index.get(inst)
+        if k:
+            d = _as_dict(rest_response.get(k))
+            if d:
+                return d.get("taskPLCalcTime", np.nan)
+
+    return np.nan
