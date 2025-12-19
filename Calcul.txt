@@ -1,0 +1,79 @@
+import re
+import json
+from typing import Any, Dict, List, Optional
+
+from google.cloud import bigquery
+
+
+INSTRUMENT_RE = re.compile(r"#sophis#([^#]+)")
+TASK_PL_CALC_RE = re.compile(r'"taskPlCalcTime"\s*:\s*([0-9]+(?:\.[0-9]+)?)')
+
+def extract_instrument(key: str) -> Optional[str]:
+    m = INSTRUMENT_RE.search(key)
+    return m.group(1) if m else None
+
+def extract_task_pl_calc_time(value_str: str) -> Optional[float]:
+    """
+    value_str ressemble à un JSON/dict string (avec "taskPlCalcTime": 0.766, ...)
+    On tente d'abord JSON, puis fallback regex.
+    """
+    # 1) tentative JSON
+    try:
+        obj = json.loads(value_str)
+        v = obj.get("taskPlCalcTime")
+        return float(v) if v is not None else None
+    except Exception:
+        pass
+
+    # 2) fallback regex (si la string n'est pas du JSON strict)
+    m = TASK_PL_CALC_RE.search(value_str)
+    return float(m.group(1)) if m else None
+
+def build_rows(results: Dict[str, str]) -> List[Dict[str, Any]]:
+    rows = []
+    for key, value_str in results.items():
+        instrument = extract_instrument(key)
+        task_pl_calc_time = extract_task_pl_calc_time(value_str)
+
+        rows.append({
+            "pvstats_key": key,
+            "instrument": instrument,
+            "taskPlCalcTime": task_pl_calc_time,
+        })
+    return rows
+
+def save_to_bigquery(
+    results: Dict[str, str],
+    project_id: str,
+    dataset_id: str,
+    table_id: str,
+):
+    client = bigquery.Client(project=project_id)
+
+    table_ref = f"{project_id}.{dataset_id}.{table_id}"
+
+    # Schéma minimal demandé
+    schema = [
+        bigquery.SchemaField("pvstats_key", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("instrument", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("taskPlCalcTime", "FLOAT", mode="NULLABLE"),
+    ]
+
+    # (Optionnel) créer la table si elle n'existe pas
+    try:
+        client.get_table(table_ref)
+    except Exception:
+        table = bigquery.Table(table_ref, schema=schema)
+        client.create_table(table)
+
+    rows = build_rows(results)
+
+    # Insert streaming (simple et direct)
+    errors = client.insert_rows_json(table_ref, rows)
+    if errors:
+        raise RuntimeError(f"BigQuery insert errors: {errors}")
+
+    return len(rows)
+
+# Exemple d’appel :
+# n = save_to_bigquery(results, 
