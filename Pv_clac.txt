@@ -1,37 +1,55 @@
-import numpy as np
+import pandas as pd
 
-def _as_dict(x):
-    """Convertit la valeur renvoyée par le service en dict."""
-    if isinstance(x, dict):
-        return x
-    if x in ("", None):
-        return {}
-    try:
-        return eval(x)
-    except Exception:
-        return {}
+# ------------------------------------------------------------
+# Step 5 (NEW): Build computation time from BigQuery dataframe
+# ------------------------------------------------------------
 
-def get_task_pl_calc_time_from_pv_stat_response(pv_stat_id, rest_response):
-    # 1) tentative via la clé exacte
-    raw = rest_response.get(pv_stat_id, None)
-    d = _as_dict(raw)
-    if d:
-        return d.get("taskPLCalcTime", np.nan)
+# 5.1 Normaliser instrument côté exploded : "sophis/72789279" -> "72789279"
+df_exploded_by_instrument["instrument_norm"] = (
+    df_exploded_by_instrument["instrument_id"]
+    .astype(str)
+    .str.split("/")
+    .str[-1]
+)
 
-    # 2) fallback : chercher par numéro d’instrument (après "#sophis")
-    instrument_id = None
-    if pv_stat_id:
-        parts = str(pv_stat_id).split("#sophis#")
-        if len(parts) > 1:
-            instrument_id = parts[1].split("#", 1)[0]  # valeur après #sophis
+# 5.2 Calculer pl_time côté BigQuery = taskPlCalcTime + taskPlDataTime
+df_pv_bigquery = df_pv_bigquery.copy()
+df_pv_bigquery["pl_time"] = (
+    df_pv_bigquery["taskPlCalcTime"].fillna(0)
+    + df_pv_bigquery["taskPlDataTime"].fillna(0)
+)
 
-    if instrument_id:
-        needle = f"#sophis#{instrument_id}#"
-        for k, v in rest_response.items():  # "premier" trouvé
-            if needle in str(k):
-                d = _as_dict(v)
-                if d:
-                    return d.get("taskPLCalcTime", np.nan)
+# 5.3 Dictionnaire exact pvstats_id -> pl_time (hit exact)
+pv_time_by_pvstat = (
+    df_pv_bigquery
+    .dropna(subset=["pvstats_id"])
+    .drop_duplicates(subset=["pvstats_id"], keep="last")  # si doublons, on garde le dernier
+    .set_index("pvstats_id")["pl_time"]
+    .to_dict()
+)
 
-    # 3) rien trouvé
-    return np.nan
+# 5.4 Moyenne par instrument (fallback)
+mean_time_by_instrument = (
+    df_pv_bigquery
+    .dropna(subset=["instrument"])
+    .groupby("instrument")["pl_time"]
+    .mean()
+    .to_dict()
+)
+
+# ------------------------------------------------------------
+# Step 6 (NEW): Compute instrument_computation_time with fallback
+# ------------------------------------------------------------
+
+# 6.1 Exact match pv_stat_id
+exact = df_exploded_by_instrument["pv_stat_id"].map(pv_time_by_pvstat)
+
+# 6.2 Fallback instrument mean
+fallback_inst = df_exploded_by_instrument["instrument_norm"].map(mean_time_by_instrument)
+
+# 6.3 Final: exact > mean instrument > 0
+df_exploded_by_instrument["instrument_computation_time"] = (
+    exact
+    .fillna(fallback_inst)
+    .fillna(0.0)
+)
