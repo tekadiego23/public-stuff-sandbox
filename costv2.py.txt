@@ -60,3 +60,32 @@ df_exploded_by_instrument["position_cost"] = (
     * df_exploded_by_instrument["position_computation_time"]
     / den
 ).fillna(0.0)
+
+
+
+
+
+def build_meta_from_positions(df_chunk: pd.DataFrame) -> pd.DataFrame:
+    base = df_chunk[["job_id", "positions"]].dropna(subset=["positions"])
+    meta_rows = []
+
+    # boucle sur les jobs (mais sur un chunk limité, c'est OK)
+    for job_id, pos in zip(base["job_id"].values, base["positions"].values):
+        # pos: dict instrument -> info
+        for inst, info in pos.items():
+            meta_rows.append((job_id, inst, info))
+
+    meta = pd.DataFrame(meta_rows, columns=["job_id", "instrument_id", "_info"])
+    info_cols = pd.json_normalize(meta["_info"])
+    return pd.concat([meta[["job_id", "instrument_id"]], info_cols], axis=1)
+
+# Exemple de chunking
+CHUNK = 200_000   # à ajuster selon RAM
+out_meta_parts = []
+
+for start in range(0, len(df_exploded_by_instrument), CHUNK):
+    chunk = df_exploded_by_instrument.iloc[start:start+CHUNK]
+    out_meta_parts.append(build_meta_from_positions(chunk))
+
+meta = pd.concat(out_meta_parts, ignore_index=True)
+
