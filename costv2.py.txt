@@ -1,97 +1,62 @@
 import pandas as pd
-import numpy as np
-import requests
-from datetime import timedelta
-from google.cloud import bigquery
 
-# === 1. RÉCUPÉRATION DES JOBS VIA API REST ===
-REST_API_URL = "https://your.api.endpoint/jobs"
-response = requests.get(REST_API_URL)
-response.raise_for_status()
-df_jobs = pd.DataFrame(response.json())
+# Garde uniquement ce qui sert à l'extraction
+base = df_exploded_by_instrument[["job_id", "positions"]].dropna(subset=["positions"])
 
-df_jobs['JobStartTime'] = pd.to_datetime(df_jobs['JobStartTime'])
-df_jobs['JobCompletionTime'] = pd.to_datetime(df_jobs['JobCompletionTime'])
-df_jobs['cluster_name'] = df_jobs['cluster_name'].astype(str)
-
-# === 2. FILTRAGE DES ENVIRONNEMENTS "firebird" UNIQUEMENT ===
-df_jobs = df_jobs[df_jobs['cluster_name'].str.lower().str.contains("firebird")].copy()
-
-# === 3. PRÉPARATION DES DATES ET DURÉES DES JOBS ===
-df_jobs['start_date'] = df_jobs['JobStartTime'].dt.normalize()
-df_jobs['end_date'] = df_jobs['JobCompletionTime'].dt.normalize()
-df_jobs['duration'] = (df_jobs['JobCompletionTime'] - df_jobs['JobStartTime']).dt.total_seconds()
-
-# Étendre chaque tâche sur les jours traversés
-date_ranges = df_jobs.apply(
-    lambda row: pd.date_range(start=row['start_date'], end=row['end_date'], freq='D'), axis=1
+# positions est un dict: { "sophis/727...": {...}, "sophis/284...": {...} }
+# -> on transforme en liste d'items puis explode
+meta = (
+    base.assign(_items=base["positions"].map(lambda d: list(d.items())))
+        .explode("_items", ignore_index=False)
 )
-df_jobs_expanded = df_jobs.loc[df_jobs.index.repeat(date_ranges.str.len())].copy()
-df_jobs_expanded['day'] = np.concatenate(date_ranges.to_numpy())
 
-# Calcul vectorisé des plages de temps sur chaque jour
-df_jobs_expanded['day_start'] = df_jobs_expanded[['JobStartTime', 'day']].max(axis=1)
-df_jobs_expanded['day_end'] = df_jobs_expanded.apply(
-    lambda row: min(row['JobCompletionTime'], row['day'] + timedelta(days=1)), axis=1
-)
-df_jobs_expanded['duration_day'] = (df_jobs_expanded['day_end'] - df_jobs_expanded['day_start']).dt.total_seconds()
+# _items = (instrument_id, info_dict)
+meta[["instrument_id", "_info"]] = pd.DataFrame(meta["_items"].tolist(), index=meta.index)
 
-# === 4. RÉCUPÉRATION DES COÛTS JOURNALIERS GCP (BigQuery) ===
-client = bigquery.Client()
-dates = df_jobs_expanded['day'].dt.date.unique().tolist()
-query = f"""
-SELECT DATE(day) AS day, env, SUM(cost) AS cost
-FROM `your_project.your_dataset.daily_costs`
-WHERE DATE(day) IN UNNEST(@dates)
-GROUP BY day, env
-"""
-job_config = bigquery.QueryJobConfig(
-    query_parameters=[bigquery.ArrayQueryParameter("dates", "DATE", dates)]
-)
-df_costs = client.query(query, job_config=job_config).to_dataframe()
-df_costs['day'] = pd.to_datetime(df_costs['day'])
+# Normalisation du dict info -> colonnes (rapide vs apply)
+info_cols = pd.json_normalize(meta["_info"])
 
-# === 5. CALCUL DU COÛT PAR JOUR POUR CHAQUE JOB ===
-grouped = df_jobs_expanded.groupby(['JobId', 'day', 'cluster_name'], as_index=False).agg({
-    'duration_day': 'sum',
-    'duration': 'first'
+# Harmonise les noms (adapte si tes clés exactes diffèrent)
+info_cols = info_cols.rename(columns={
+    "epi": "epi_list",
+    "portfolioId": "portfolioId",
+    "legalEntity": "legalEntity",
+    "name": "name",
+    "isdapPlussType": "isdapPlussType",
+    "sophisPayoffCat": "sophisPayoffCat",
+    "hmsBook": "hmsBook",
+    "desk": "desk",
 })
-grouped['ratio'] = grouped['duration_day'] / grouped['duration']
-grouped = grouped.merge(df_costs, left_on=['day', 'cluster_name'], right_on=['day', 'env'], how='left')
-grouped['job_cost'] = grouped['ratio'] * grouped['cost']
 
-df_job_costs = grouped.groupby('JobId', as_index=False)['job_cost'].sum()
+meta = pd.concat([meta[["job_id", "instrument_id"]], info_cols], axis=1)
 
-# === 6. CALCUL DU COÛT PAR TÂCHE ===
-# Tâches : on considère que chaque ligne de df_jobs_expanded est une tâche
-df_jobs_expanded['TaskStartTime'] = df_jobs_expanded['day_start']
-df_jobs_expanded['TaskEndTime'] = df_jobs_expanded['day_end']
-df_jobs_expanded['TaskExecutionTime'] = (df_jobs_expanded['TaskEndTime'] - df_jobs_expanded['TaskStartTime']).dt.total_seconds()
+# (Optionnel) éviter les doublons si même instrument présent plusieurs fois
+meta = meta.drop_duplicates(subset=["job_id", "instrument_id"], keep="last")
 
-# Durée totale du job (toutes tâches) par jour
-grouped_day = df_jobs_expanded.groupby(['JobId', 'day', 'cluster_name'], as_index=False)['TaskExecutionTime'].sum()
-grouped_day.rename(columns={'TaskExecutionTime': 'total_execution_time_day'}, inplace=True)
 
-# Join avec chaque tâche
-df_tasks = df_jobs_expanded.merge(grouped_day, on=['JobId', 'day', 'cluster_name'], how='left')
-df_tasks = df_tasks.merge(df_costs, left_on=['day', 'cluster_name'], right_on=['day', 'env'], how='left')
 
-# Calcul du coût de la tâche
-df_tasks['task_cost'] = (df_tasks['TaskExecutionTime'] / df_tasks['total_execution_time_day']) * df_tasks['cost']
+# Supprime les grosses colonnes qui ne servent plus (positions = énorme)
+df_exploded_by_instrument = df_exploded_by_instrument.drop(columns=["positions"], errors="ignore")
 
-# === 7. AFFICHAGE DES RÉSULTATS ===
-import ace_tools as tools
-
-tools.display_dataframe_to_user(
-    name="Coût total GCP par JobId (firebird only)",
-    dataframe=df_job_costs
+df_exploded_by_instrument = df_exploded_by_instrument.merge(
+    meta,
+    on=["job_id", "instrument_id"],
+    how="left"
 )
 
-tools.display_dataframe_to_user(
-    name="Détail des tâches avec coût GCP",
-    dataframe=df_tasks[['JobId', 'TaskStartTime', 'TaskEndTime', 'TaskExecutionTime', 'day', 'task_cost']]
+
+df_exploded_by_instrument = (
+    df_exploded_by_instrument
+    .explode("epi_list", ignore_index=True)
+    .rename(columns={"epi_list": "position_id"})   # si tu veux renommer epi -> position
 )
 
-# Optionnel : export CSV
-# df_job_costs.to_csv("job_costs_firebird.csv", index=False)
-# df_tasks.to_csv("task_costs_firebird.csv", index=False)
+
+# éviter division par 0
+den = df_exploded_by_instrument["sum_instrument_computation_time"].replace({0: pd.NA})
+
+df_exploded_by_instrument["position_cost"] = (
+    df_exploded_by_instrument["job_cost"]
+    * df_exploded_by_instrument["position_computation_time"]
+    / den
+).fillna(0.0)
