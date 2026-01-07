@@ -44,3 +44,52 @@ df["final_pl_time"] = (
     .fillna(df["pl_time_mean_instrument"])
     .fillna(0)
 )
+
+
+
+
+
+
+++++++++
+
+
+import pandas as pd
+
+def explode_positions_with_meta(by_job_df: pd.DataFrame) -> pd.DataFrame:
+    df = by_job_df.copy()
+
+    # 1) Sécuriser le type de positions (évite les None/NaN/string)
+    df["positions"] = df["positions"].where(df["positions"].map(type).eq(dict), {})
+
+    # 2) Construire une colonne "items" = liste de (product_key, meta_dict)
+    #    (map est ok; on évite apply(axis=1))
+    df["_pos_items"] = df["positions"].map(lambda d: list(d.items()))
+
+    # 3) Explode 1 ligne par position
+    long_df = df.explode("_pos_items", ignore_index=True)
+
+    # Si certaines lignes avaient positions={}, _pos_items devient NaN après explode
+    long_df = long_df.dropna(subset=["_pos_items"])
+
+    # 4) Séparer key / meta
+    tmp = pd.DataFrame(long_df["_pos_items"].tolist(), columns=["product_key", "pos_meta"])
+    long_df = long_df.drop(columns=["_pos_items"])
+
+    long_df = pd.concat([long_df.reset_index(drop=True), tmp], axis=1)
+
+    # 5) Aplatir les métadonnées (pos_meta dict -> colonnes)
+    meta_df = pd.json_normalize(long_df["pos_meta"]).add_prefix("pos_")
+    long_df = pd.concat([long_df.drop(columns=["pos_meta"]), meta_df], axis=1)
+
+    # 6) Construire pv_stat_id (vectorisé)
+    #    pvstats#var#sophis#7200...#pricing#YYYY-MM-DD
+    #    (regex=False = plus rapide)
+    long_df["pv_stat_id"] = (
+        "pvstats#var#" +
+        long_df["product_key"].str.replace("/", "#", regex=False) +
+        "#pricing#" +
+        long_df["pv_cob_date"].astype(str)
+    )
+
+    return long_df
+
