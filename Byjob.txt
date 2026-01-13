@@ -1,0 +1,169 @@
+import asyncio
+import aiohttp
+import pandas as pd
+from typing import Any, Dict, Optional, List, Iterable
+from functools import partial
+
+# Ajuste selon ton infra / backend (commence à 200-400)
+MAX_IN_FLIGHT = 300
+CONNECTOR_LIMIT = 0              # 0 = pas de limite côté connector (on limite avec semaphore)
+LIMIT_PER_HOST = 0               # idem
+DNS_CACHE_TTL = 300
+
+async def get_all_metrics_for_sessions(
+    envs_sessions,
+    extra_params: Dict[str, Any],
+) -> pd.DataFrame:
+    """
+    Envoie toutes les requêtes en parallèle (concurrence bornée) et retourne un DataFrame unique.
+    Optimisations:
+      - ne crée pas un mega-listing de tasks + gather
+      - collecte les résultats au fil de l'eau (as_completed)
+      - concatène UNE seule fois
+    """
+
+    # 1) build "jobs" (liste légère de params), pas une liste de tasks
+    jobs = []
+    for env, config in env_configs.items():
+        env_data = envs_sessions.get(env)
+        if not env_data:
+            logger.warning(f"No sessions dict for env = {env}")
+            continue
+
+        env_name = env_data.get("env_name")
+        if env_name is None:
+            logger.warning(f"missing env_name in {env_data}")
+
+        base_url = config["base_url"]
+        access_token = config["access_token"]
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        # ⚠️ si env_data contient {envId: sessions, "env_name": ...}
+        # on itère sur les envId en excluant la clé env_name
+        for env_id, sessions in env_data.items():
+            if env_id == "env_name":
+                continue
+            for sid in sessions:
+                url = f"{base_url}/{env_id}/sessions/{sid['id']}/bulkMetrics"
+                ctx = {
+                    "jest_api": env,
+                    "session_name": sid.get("sessionName"),
+                    "env_name": env_name,
+                }
+                jobs.append((url, extra_params, ctx, headers))
+
+    if not jobs:
+        return pd.DataFrame()
+
+    timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_connect=10, sock_read=60)
+    connector = aiohttp.TCPConnector(
+        limit=CONNECTOR_LIMIT,
+        limit_per_host=LIMIT_PER_HOST,
+        ttl_dns_cache=DNS_CACHE_TTL,
+        ssl=False,              # évite verify_ssl par requête
+        enable_cleanup_closed=True,
+    )
+
+    sem = asyncio.Semaphore(MAX_IN_FLIGHT)
+    dfs: List[pd.DataFrame] = []
+
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout, raise_for_status=False) as http:
+        # 2) Crée les tasks progressivement mais on les consomme au fil de l’eau
+        tasks = [asyncio.create_task(fetch_one(http, sem, *job)) for job in jobs]
+
+        # 3) as_completed => on traite dès qu’une réponse arrive
+        for fut in asyncio.as_completed(tasks):
+            df = await fut
+            if df is not None and not df.empty:
+                dfs.append(df)
+
+    if not dfs:
+        print("[billing_by_job] No metrics data found for the given date range.")
+        return pd.DataFrame()
+
+    # 4) concat UNIQUE => gain massif
+    return pd.concat(dfs, ignore_index=True, copy=False)
+
+
+import aiohttp
+
+MAX_RETRIES = 3
+
+async def fetch_one(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    url: str,
+    params: Dict[str, Any],
+    context: Dict[str, str],
+    headers: Dict[str, str],
+) -> Optional[pd.DataFrame]:
+
+    async with sem:
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with session.get(url, params=params, headers=headers) as resp:
+                    # gérer 4xx/5xx sans flinguer tout le batch
+                    if resp.status >= 500:
+                        # retry sur 5xx
+                        raise aiohttp.ClientResponseError(
+                            request_info=resp.request_info,
+                            history=resp.history,
+                            status=resp.status,
+                            message=f"Server error {resp.status}",
+                            headers=resp.headers,
+                        )
+                    if resp.status >= 400:
+                        # pas de retry sur 4xx (souvent définitif)
+                        text = await resp.text()
+                        logger.warning(f"[WARN] {url} -> HTTP {resp.status}: {text[:200]}")
+                        return None
+
+                    payload = await resp.read()
+
+                # IMPORTANT: parsing Avro + pandas peut être CPU-bound => offload thread
+                loop = asyncio.get_running_loop()
+                df = await loop.run_in_executor(None, parse_avro_and_return_df, payload)
+
+                if df is None or df.empty:
+                    return None
+
+                # colonnes meta (cheap)
+                df["session_name"] = context.get("session_name")
+                df["jest_api"] = context.get("jest_api")
+                df["env_name"] = context.get("env_name")
+                return df
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < MAX_RETRIES - 1:
+                    await _sleep_backoff(attempt)
+                    continue
+                logger.warning(f"[WARN] {url} -> {type(e).__name__}: {e}")
+                return None
+
+
+
+from io import BytesIO
+import pandas as pd
+
+def parse_avro_and_return_df(avro_data: bytes) -> pd.DataFrame:
+    if not avro_data:
+        return pd.DataFrame()
+
+    avro_file = BytesIO(avro_data)
+
+    # Dédup streaming: on garde le premier TaskId complet (TaskEndTime présent)
+    by_task = {}
+    for rec in reader(avro_file):
+        task_id = rec.get("TaskId")
+        if task_id is None:
+            continue
+        if rec.get("TaskEndTime") is None:
+            continue
+        # keep first occurrence
+        if task_id not in by_task:
+            by_task[task_id] = rec
+
+    if not by_task:
+        return pd.DataFrame()
+
+    return pd.DataFrame.from_records(by_task.values())
