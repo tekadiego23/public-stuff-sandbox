@@ -1,0 +1,133 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Cloud Run Blue-Green">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10">
+      <root>
+        <mxCell id="0"/><mxCell id="1" parent="0"/>
+
+        <!-- Jenkins -->
+        <mxCell id="jenkins" value="Jenkins" style="rounded=1;fillColor=#f5f5f5;strokeColor=#333;" vertex="1" parent="1">
+          <mxGeometry x="40" y="200" width="120" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Hydre -->
+        <mxCell id="hydre" value="Hydre" style="rounded=1;fillColor=#fff2cc;strokeColor=#333;" vertex="1" parent="1">
+          <mxGeometry x="220" y="200" width="120" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Cloud Run Service -->
+        <mxCell id="service" value="Cloud Run Service" style="rounded=1;fillColor=#dae8fc;strokeColor=#333;" vertex="1" parent="1">
+          <mxGeometry x="420" y="200" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Blue Revision -->
+        <mxCell id="blue" value="Revision (Blue)\n95%" style="rounded=1;fillColor=#cce5ff;strokeColor=#1a73e8;" vertex="1" parent="1">
+          <mxGeometry x="640" y="140" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Green Revision -->
+        <mxCell id="green" value="Revision (Green)\n5%" style="rounded=1;fillColor=#d9ead3;strokeColor=#38761d;" vertex="1" parent="1">
+          <mxGeometry x="640" y="260" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Traffic -->
+        <mxCell id="traffic" value="Live Traffic" style="rounded=1;fillColor=#eeeeee;strokeColor=#333;" vertex="1" parent="1">
+          <mxGeometry x="840" y="200" width="140" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" edge="1" parent="1" source="jenkins" target="hydre"/>
+        <mxCell id="e2" edge="1" parent="1" source="hydre" target="service"/>
+        <mxCell id="e3" edge="1" parent="1" source="service" target="blue"/>
+        <mxCell id="e4" edge="1" parent="1" source="service" target="green"/>
+        <mxCell id="e5" edge="1" parent="1" source="blue" target="traffic"/>
+        <mxCell id="e6" edge="1" parent="1" source="green" target="traffic"/>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
+
+<mxfile host="app.diagrams.net">
+  <diagram name="GKE Blue-Green">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10">
+      <root>
+        <mxCell id="0"/><mxCell id="1" parent="0"/>
+
+        <mxCell id="jenkins" value="Jenkins" style="rounded=1;fillColor=#f5f5f5;" vertex="1" parent="1">
+          <mxGeometry x="40" y="220" width="120" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="hydre" value="Hydre" style="rounded=1;fillColor=#fff2cc;" vertex="1" parent="1">
+          <mxGeometry x="220" y="220" width="120" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="deploy" value="Deployment" style="rounded=1;fillColor=#dae8fc;" vertex="1" parent="1">
+          <mxGeometry x="420" y="220" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="bluepods" value="Pods (Blue)\ncolor=blue" style="rounded=1;fillColor=#cce5ff;strokeColor=#1a73e8;" vertex="1" parent="1">
+          <mxGeometry x="640" y="140" width="180" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="greenpods" value="Pods (Green)\ncolor=green" style="rounded=1;fillColor=#d9ead3;strokeColor=#38761d;" vertex="1" parent="1">
+          <mxGeometry x="640" y="300" width="180" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="service" value="Service\nselector: color=TARGET" style="rounded=1;fillColor=#eeeeee;" vertex="1" parent="1">
+          <mxGeometry x="880" y="220" width="200" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e1" edge="1" parent="1" source="jenkins" target="hydre"/>
+        <mxCell id="e2" edge="1" parent="1" source="hydre" target="deploy"/>
+        <mxCell id="e3" edge="1" parent="1" source="deploy" target="bluepods"/>
+        <mxCell id="e4" edge="1" parent="1" source="deploy" target="greenpods"/>
+        <mxCell id="e5" edge="1" parent="1" source="service" target="bluepods"/>
+        <mxCell id="e6" edge="1" parent="1" source="service" target="greenpods"/>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
+
+
+<mxfile host="app.diagrams.net">
+  <diagram name="GCE MIG Blue-Green">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10">
+      <root>
+        <mxCell id="0"/><mxCell id="1" parent="0"/>
+
+        <mxCell id="jenkins" value="Jenkins" style="rounded=1;fillColor=#f5f5f5;" vertex="1" parent="1">
+          <mxGeometry x="40" y="220" width="120" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="hydre" value="Hydre" style="rounded=1;fillColor=#fff2cc;" vertex="1" parent="1">
+          <mxGeometry x="220" y="220" width="120" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="tf" value="Terraform" style="rounded=1;fillColor=#ead1dc;" vertex="1" parent="1">
+          <mxGeometry x="420" y="220" width="140" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="prev" value="MIG Version (Prev)\n95%" style="rounded=1;fillColor=#cce5ff;strokeColor=#1a73e8;" vertex="1" parent="1">
+          <mxGeometry x="640" y="140" width="200" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="new" value="MIG Version (New)\n5%" style="rounded=1;fillColor=#d9ead3;strokeColor=#38761d;" vertex="1" parent="1">
+          <mxGeometry x="640" y="300" width="200" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="traffic" value="User Traffic" style="rounded=1;fillColor=#eeeeee;" vertex="1" parent="1">
+          <mxGeometry x="900" y="220" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e1" edge="1" parent="1" source="jenkins" target="hydre"/>
+        <mxCell id="e2" edge="1" parent="1" source="hydre" target="tf"/>
+        <mxCell id="e3" edge="1" parent="1" source="tf" target="prev"/>
+        <mxCell id="e4" edge="1" parent="1" source="tf" target="new"/>
+        <mxCell id="e5" edge="1" parent="1" source="prev" target="traffic"/>
+        <mxCell id="e6" edge="1" parent="1" source="new" target="traffic"/>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
