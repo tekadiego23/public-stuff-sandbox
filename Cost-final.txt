@@ -1,0 +1,48 @@
+CREATE OR REPLACE VIEW finops.cost_daily_final AS
+WITH base AS (
+  SELECT
+    b.*,
+    DATE_TRUNC(b.usage_date, MONTH) AS month
+  FROM finops.cost_daily_report_base b
+),
+
+uplift AS (
+  SELECT month, uplift_rate
+  FROM finops.shared_uplift_rates
+  WHERE vendor = 'GCP'
+),
+
+vat AS (
+  SELECT month, irr_vat_rate
+  FROM finops.vat_rates
+)
+
+SELECT
+  base.*,
+
+  IFNULL(u.uplift_rate, 0) AS uplift_rate,
+  IFNULL(v.irr_vat_rate, 0) AS irr_vat_rate,
+
+  -- CSP TOTAL
+  cost_from_csp AS cost_csp_total,
+
+  -- SHARED
+  cost_from_csp * IFNULL(u.uplift_rate,0) AS shared_cost,
+
+  -- VAT
+  (cost_from_csp + (cost_from_csp * IFNULL(u.uplift_rate,0)))
+    * IFNULL(v.irr_vat_rate,0) AS irr_vat,
+
+  -- FINAL
+  (cost_from_csp + (cost_from_csp * IFNULL(u.uplift_rate,0)))
+  +
+  (
+    (cost_from_csp + (cost_from_csp * IFNULL(u.uplift_rate,0)))
+    * IFNULL(v.irr_vat_rate,0)
+  ) AS cost_final
+
+FROM base
+LEFT JOIN uplift u
+  ON base.month = u.month
+LEFT JOIN vat v
+  ON base.month = v.month;
