@@ -1,0 +1,204 @@
+-- =====================================================
+-- FINOPS GCP COST MODEL (Cloudability-like)
+-- =====================================================
+
+CREATE SCHEMA IF NOT EXISTS finops;
+
+-- =====================================================
+-- CONFIG TABLES
+-- =====================================================
+
+CREATE TABLE IF NOT EXISTS finops.shared_services (
+  service STRING NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS finops.shared_uplift_rates (
+  vendor STRING,
+  month DATE,
+  uplift_rate FLOAT64
+);
+
+CREATE TABLE IF NOT EXISTS finops.vat_rates (
+  month DATE,
+  irr_vat_rate FLOAT64
+);
+
+-- =====================================================
+-- BASE BILLING VIEW (CSP COST)
+-- =====================================================
+
+CREATE OR REPLACE VIEW finops.billing_base AS
+SELECT
+  DATE(usage_start_time) AS usage_date,
+  billing_account_id,
+  project.id AS account_id,
+  project.name AS account_name,
+  service.description AS service,
+
+  SUM(
+    cost
+    + IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c), 0)
+  ) AS cost_from_csp
+
+FROM `billing_prod.gcp_billing_export_resource_v1_XXXX`
+GROUP BY 1,2,3,4,5;
+
+-- =====================================================
+-- CSP REALLOCATIONS (SHARED SERVICES POOL)
+-- =====================================================
+
+CREATE OR REPLACE VIEW finops.csp_reallocations_daily AS
+WITH base AS (
+  SELECT * FROM finops.billing_base
+),
+
+shared_pool AS (
+  SELECT
+    usage_date,
+    SUM(cost_from_csp) AS shared_services_pool
+  FROM base b
+  JOIN finops.shared_services ss
+    ON ss.service = b.service
+  GROUP BY 1
+),
+
+receivers AS (
+  SELECT
+    usage_date,
+    account_id,
+    SUM(cost_from_csp) AS receiver_day_cost,
+    SAFE_DIVIDE(
+      SUM(cost_from_csp),
+      SUM(SUM(cost_from_csp)) OVER (PARTITION BY usage_date)
+    ) AS weight
+  FROM base
+  GROUP BY 1,2
+)
+
+SELECT
+  r.usage_date,
+  r.account_id,
+  (r.weight * IFNULL(p.shared_services_pool,0)) AS cost_csp_reallocations
+FROM receivers r
+LEFT JOIN shared_pool p
+  USING (usage_date);
+
+-- =====================================================
+-- FINAL COST MODEL (CUSTOM COST METRICS)
+-- =====================================================
+
+CREATE OR REPLACE VIEW finops.cost_daily_final AS
+WITH base AS (
+  SELECT * FROM finops.billing_base
+),
+
+realloc AS (
+  SELECT * FROM finops.csp_reallocations_daily
+),
+
+daily AS (
+  SELECT
+    b.usage_date,
+    b.billing_account_id,
+    b.account_id,
+    b.account_name,
+
+    SUM(b.cost_from_csp) AS cost_from_csp,
+    SUM(IFNULL(r.cost_csp_reallocations,0)) AS cost_csp_reallocations
+
+  FROM base b
+  LEFT JOIN realloc r
+    ON r.usage_date = b.usage_date
+   AND r.account_id = b.account_id
+
+  GROUP BY 1,2,3,4
+),
+
+rates AS (
+  SELECT
+    d.*,
+    DATE_TRUNC(d.usage_date, MONTH) AS month
+  FROM daily d
+)
+
+SELECT
+  usage_date,
+  billing_account_id,
+  account_id,
+  account_name,
+
+  -- Cost (from CSP)
+  cost_from_csp,
+
+  -- CSP Reallocations
+  cost_csp_reallocations,
+
+  -- CSP Total
+  (cost_from_csp + cost_csp_reallocations) AS cost_csp_total,
+
+  -- Shared Cost (uplift)
+  (cost_from_csp + cost_csp_reallocations)
+    * IFNULL((
+        SELECT uplift_rate
+        FROM finops.shared_uplift_rates u
+        WHERE u.vendor='GCP'
+          AND u.month = month
+        LIMIT 1
+      ), 0) AS shared_cost,
+
+  -- IRR VAT
+  (
+    (cost_from_csp + cost_csp_reallocations)
+    * IFNULL((
+        SELECT uplift_rate
+        FROM finops.shared_uplift_rates u
+        WHERE u.vendor='GCP'
+          AND u.month = month
+        LIMIT 1
+      ), 0)
+  +
+    (cost_from_csp + cost_csp_reallocations)
+  )
+  * IFNULL((
+      SELECT irr_vat_rate
+      FROM finops.vat_rates v
+      WHERE v.month = month
+      LIMIT 1
+    ), 0) AS irr_vat,
+
+  -- FINAL COST
+  (
+    (cost_from_csp + cost_csp_reallocations)
+    +
+    ((cost_from_csp + cost_csp_reallocations)
+      * IFNULL((
+          SELECT uplift_rate
+          FROM finops.shared_uplift_rates u
+          WHERE u.vendor='GCP'
+            AND u.month = month
+          LIMIT 1
+        ), 0))
+    +
+    (
+      (
+        (cost_from_csp + cost_csp_reallocations)
+        +
+        ((cost_from_csp + cost_csp_reallocations)
+          * IFNULL((
+              SELECT uplift_rate
+              FROM finops.shared_uplift_rates u
+              WHERE u.vendor='GCP'
+                AND u.month = month
+              LIMIT 1
+            ), 0))
+      )
+      * IFNULL((
+          SELECT irr_vat_rate
+          FROM finops.vat_rates v
+          WHERE v.month = month
+          LIMIT 1
+        ), 0)
+    )
+  ) AS cost_final
+
+FROM rates;
