@@ -1,0 +1,294 @@
+-- =====================================================
+-- FINOPS GCP REPORTING MODEL (ALL SERVICES SHARED)
+-- Includes: labels + service + sku + region + resource + project
+-- Shared Cost = CSP-wide uplift %
+-- IRR VAT applied on (CSP Total + Shared)
+-- =====================================================
+
+CREATE SCHEMA IF NOT EXISTS finops;
+
+-- =========================
+-- CONFIG TABLES (monthly)
+-- =========================
+
+CREATE TABLE IF NOT EXISTS finops.shared_uplift_rates (
+  vendor STRING,          -- ex: 'GCP'
+  month DATE,             -- ex: 2026-02-01
+  uplift_rate FLOAT64     -- ex: 0.0125
+);
+
+CREATE TABLE IF NOT EXISTS finops.vat_rates (
+  month DATE,             -- ex: 2026-02-01
+  irr_vat_rate FLOAT64    -- ex: 0.20
+);
+
+-- =====================================================
+-- 1) LINE ITEM ENRICHED VIEW
+--    - keep near-raw granularity
+--    - extract/pivot labels needed for reporting
+-- =====================================================
+
+CREATE OR REPLACE VIEW finops.billing_line_enriched AS
+WITH src AS (
+  SELECT
+    billing_account_id,
+
+    usage_start_time,
+    usage_end_time,
+    DATE(usage_start_time) AS usage_date,
+
+    -- Project / Account
+    project.id   AS account_id,
+    project.name AS account_name,
+    project.number AS account_number,
+
+    -- Service / SKU
+    service.id AS service_id,
+    service.description AS service_name,
+    sku.id AS sku_id,
+    sku.description AS sku_name,
+
+    -- Location / Resource
+    location.location AS location_name,
+    location.region   AS region,
+    location.zone     AS zone,
+
+    resource.name AS resource_name,
+    resource.global_name AS resource_global_name,
+
+    -- Financial
+    currency,
+    currency_conversion_rate,
+    cost AS cost_gross,
+
+    -- credits is repeated record
+    IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c), 0) AS credits_total,
+
+    -- Net cost (from CSP)
+    (cost + IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c), 0)) AS cost_from_csp,
+
+    -- Optional fields often present in export (keep if you have them)
+    cost_type,
+    transaction_type,
+    seller_name,
+
+    -- Keep labels arrays (repeated RECORD key/value)
+    labels,
+    system_labels
+
+  FROM `billing_prod.gcp_billing_export_resource_v1_XXXX`
+),
+
+lbl AS (
+  SELECT
+    s.*,
+
+    -- Flatten labels to JSON string for audit/debug in Looker Studio
+    TO_JSON_STRING(ARRAY(
+      SELECT AS STRUCT l.key, l.value
+      FROM UNNEST(s.labels) l
+      ORDER BY l.key
+    )) AS labels_json,
+
+    TO_JSON_STRING(ARRAY(
+      SELECT AS STRUCT sl.key, sl.value
+      FROM UNNEST(s.system_labels) sl
+      ORDER BY sl.key
+    )) AS system_labels_json,
+
+    -- Common “Cloudability-like” pivots (edit the key lists to match your naming)
+    -- Environment (key/value style)
+    (SELECT l.key   FROM UNNEST(s.labels) l WHERE LOWER(l.key) IN ('environment','env') LIMIT 1) AS environment_label_key,
+    (SELECT l.value FROM UNNEST(s.labels) l WHERE LOWER(l.key) IN ('environment','env') LIMIT 1) AS environment_label_value,
+
+    -- Component / Service component
+    (SELECT l.key   FROM UNNEST(s.labels) l WHERE LOWER(l.key) IN ('component','component_name','component-name','service_component') LIMIT 1) AS component_label_key,
+    (SELECT l.value FROM UNNEST(s.labels) l WHERE LOWER(l.key) IN ('component','component_name','component-name','service_component') LIMIT 1) AS component_label_value,
+
+    -- Workload / App
+    (SELECT l.key   FROM UNNEST(s.labels) l WHERE LOWER(l.key) IN ('workload','application','app','app_name','app-name') LIMIT 1) AS workload_label_key,
+    (SELECT l.value FROM UNNEST(s.labels) l WHERE LOWER(l.key) IN ('workload','application','app','app_name','app-name') LIMIT 1) AS workload_label_value,
+
+    -- Owner
+    (SELECT l.key   FROM UNNEST(s.labels) l WHERE LOWER(l.key) IN ('owner','business_owner','service_owner','tech_owner') LIMIT 1) AS owner_label_key,
+    (SELECT l.value FROM UNNEST(s.labels) l WHERE LOWER(l.key) IN ('owner','business_owner','service_owner','tech_owner') LIMIT 1) AS owner_label_value,
+
+    -- Purpose
+    (SELECT l.key   FROM UNNEST(s.labels) l WHERE LOWER(l.key) IN ('purpose','use_case','usecase') LIMIT 1) AS purpose_label_key,
+    (SELECT l.value FROM UNNEST(s.labels) l WHERE LOWER(l.key) IN ('purpose','use_case','usecase') LIMIT 1) AS purpose_label_value,
+
+    -- Region label (sometimes custom)
+    (SELECT l.key   FROM UNNEST(s.labels) l WHERE LOWER(l.key) IN ('region') LIMIT 1) AS region_label_key,
+    (SELECT l.value FROM UNNEST(s.labels) l WHERE LOWER(l.key) IN ('region') LIMIT 1) AS region_label_value
+
+  FROM src s
+)
+
+SELECT * FROM lbl;
+
+-- =====================================================
+-- 2) DAILY AGGREGATION VIEW (reporting grain)
+--    Grain: day + billing_account + project + service + sku + region + resource + label pivots
+-- =====================================================
+
+CREATE OR REPLACE VIEW finops.cost_daily_report_base AS
+SELECT
+  usage_date,
+  billing_account_id,
+
+  account_id,
+  account_name,
+  account_number,
+
+  service_id,
+  service_name,
+  sku_id,
+  sku_name,
+
+  location_name,
+  region,
+  zone,
+
+  resource_name,
+  resource_global_name,
+
+  -- label pivots
+  environment_label_key,
+  environment_label_value,
+  component_label_key,
+  component_label_value,
+  workload_label_key,
+  workload_label_value,
+  owner_label_key,
+  owner_label_value,
+  purpose_label_key,
+  purpose_label_value,
+  region_label_key,
+  region_label_value,
+
+  -- keep full label json for tracing
+  labels_json,
+  system_labels_json,
+
+  -- money / fx (aggregated)
+  ANY_VALUE(currency) AS currency,
+  ANY_VALUE(currency_conversion_rate) AS currency_conversion_rate,
+
+  SUM(cost_gross) AS cost_gross,
+  SUM(credits_total) AS credits_total,
+
+  -- 1) Cost (from CSP)
+  SUM(cost_from_csp) AS cost_from_csp
+
+FROM finops.billing_line_enriched
+GROUP BY
+  usage_date, billing_account_id,
+  account_id, account_name, account_number,
+  service_id, service_name, sku_id, sku_name,
+  location_name, region, zone,
+  resource_name, resource_global_name,
+  environment_label_key, environment_label_value,
+  component_label_key, component_label_value,
+  workload_label_key, workload_label_value,
+  owner_label_key, owner_label_value,
+  purpose_label_key, purpose_label_value,
+  region_label_key, region_label_value,
+  labels_json, system_labels_json;
+
+-- =====================================================
+-- 3) FINAL VIEW (Looker Studio source)
+--    Adds: CSP Total, Shared uplift, IRR VAT, Final
+-- =====================================================
+
+CREATE OR REPLACE VIEW finops.cost_daily_final AS
+WITH base AS (
+  SELECT
+    b.*,
+    DATE_TRUNC(b.usage_date, MONTH) AS month
+  FROM finops.cost_daily_report_base b
+),
+rates AS (
+  SELECT
+    x.*,
+
+    IFNULL((
+      SELECT uplift_rate
+      FROM finops.shared_uplift_rates u
+      WHERE u.vendor = 'GCP'
+        AND u.month = x.month
+      LIMIT 1
+    ), 0) AS uplift_rate,
+
+    IFNULL((
+      SELECT irr_vat_rate
+      FROM finops.vat_rates v
+      WHERE v.month = x.month
+      LIMIT 1
+    ), 0) AS irr_vat_rate
+
+  FROM base x
+)
+SELECT
+  -- Dimensions
+  usage_date,
+  billing_account_id,
+
+  account_id,
+  account_name,
+  account_number,
+
+  service_id,
+  service_name,
+  sku_id,
+  sku_name,
+
+  location_name,
+  region,
+  zone,
+
+  resource_name,
+  resource_global_name,
+
+  environment_label_key,
+  environment_label_value,
+  component_label_key,
+  component_label_value,
+  workload_label_key,
+  workload_label_value,
+  owner_label_key,
+  owner_label_value,
+  purpose_label_key,
+  purpose_label_value,
+  region_label_key,
+  region_label_value,
+
+  labels_json,
+  system_labels_json,
+
+  currency,
+  currency_conversion_rate,
+
+  -- Base cost fields
+  cost_gross,
+  credits_total,
+
+  -- 1) Cost (from CSP)
+  cost_from_csp,
+
+  -- 2) Cost (CSP Reallocations) - none in this model (all services shared)
+  0.0 AS cost_csp_reallocations,
+
+  -- 3) Cost (CSP Total)
+  cost_from_csp AS cost_csp_total,
+
+  -- 4) Shared Cost (uplift %)
+  cost_from_csp * uplift_rate AS shared_cost,
+
+  -- 6) IRR VAT (on CSP Total + Shared)
+  (cost_from_csp + (cost_from_csp * uplift_rate)) * irr_vat_rate AS irr_vat,
+
+  -- 7) Cost (Final)
+  (cost_from_csp + (cost_from_csp * uplift_rate))
+  + ((cost_from_csp + (cost_from_csp * uplift_rate)) * irr_vat_rate) AS cost_final
+
+FROM rates;
