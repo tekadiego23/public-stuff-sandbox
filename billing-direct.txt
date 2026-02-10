@@ -1,0 +1,116 @@
+-- =====================================================
+-- FINOPS GCP COST MODEL (Cloudability-like, ALL SERVICES)
+-- Shared Cost = CSP-wide uplift %
+-- =====================================================
+
+CREATE SCHEMA IF NOT EXISTS finops;
+
+-- =====================================================
+-- CONFIG TABLES
+-- =====================================================
+
+CREATE TABLE IF NOT EXISTS finops.shared_uplift_rates (
+  vendor STRING,          -- ex: 'GCP'
+  month DATE,             -- ex: 2026-02-01
+  uplift_rate FLOAT64     -- ex: 0.0125
+);
+
+CREATE TABLE IF NOT EXISTS finops.vat_rates (
+  month DATE,             -- ex: 2026-02-01
+  irr_vat_rate FLOAT64    -- ex: 0.20
+);
+
+-- =====================================================
+-- BASE BILLING VIEW (CSP COST)
+-- Replace table name below with your billing export table
+-- =====================================================
+
+CREATE OR REPLACE VIEW finops.billing_base AS
+SELECT
+  DATE(usage_start_time) AS usage_date,
+  billing_account_id,
+  project.id AS account_id,
+  project.name AS account_name,
+  service.description AS service,
+
+  -- Net provider cost (CSP)
+  SUM(
+    cost + IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c), 0)
+  ) AS cost_from_csp
+
+FROM `billing_prod.gcp_billing_export_resource_v1_XXXX`
+GROUP BY 1,2,3,4,5;
+
+-- =====================================================
+-- FINAL DAILY COST VIEW (LOOKER STUDIO SOURCE)
+-- =====================================================
+
+CREATE OR REPLACE VIEW finops.cost_daily_final AS
+WITH daily AS (
+  SELECT
+    usage_date,
+    billing_account_id,
+    account_id,
+    account_name,
+    service,
+
+    -- 1) Cost (from CSP)
+    cost_from_csp
+
+  FROM finops.billing_base
+),
+rates AS (
+  SELECT
+    d.*,
+    DATE_TRUNC(d.usage_date, MONTH) AS month,
+
+    IFNULL((
+      SELECT uplift_rate
+      FROM finops.shared_uplift_rates u
+      WHERE u.vendor = 'GCP'
+        AND u.month = DATE_TRUNC(d.usage_date, MONTH)
+      LIMIT 1
+    ), 0) AS uplift_rate,
+
+    IFNULL((
+      SELECT irr_vat_rate
+      FROM finops.vat_rates v
+      WHERE v.month = DATE_TRUNC(d.usage_date, MONTH)
+      LIMIT 1
+    ), 0) AS irr_vat_rate
+
+  FROM daily d
+)
+
+SELECT
+  usage_date,
+  billing_account_id,
+  account_id,
+  account_name,
+  service,
+
+  -- 1) Cost (from CSP)
+  cost_from_csp,
+
+  -- 2) Cost (CSP Reallocations) - none in this model
+  0.0 AS cost_csp_reallocations,
+
+  -- 3) Cost (CSP Total)
+  cost_from_csp AS cost_csp_total,
+
+  -- 4) Shared Cost = uplift %
+  cost_from_csp * uplift_rate AS shared_cost,
+
+  -- 6) IRR VAT (applied on CSP Total + Shared)
+  (cost_from_csp + (cost_from_csp * uplift_rate)) * irr_vat_rate AS irr_vat,
+
+  -- 7) Cost (Final)
+  (cost_from_csp + (cost_from_csp * uplift_rate)) +
+  ((cost_from_csp + (cost_from_csp * uplift_rate)) * irr_vat_rate) AS cost_final
+
+FROM rates;
+
+
+
+INSERT INTO finops.shared_uplift_rates VALUES ('GCP', '2026-02-01', 0.012);
+INSERT INTO finops.vat_rates VALUES ('2026-02-01', 0.20);
